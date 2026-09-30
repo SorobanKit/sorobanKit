@@ -57,7 +57,13 @@ async function runCleanup(prisma) {
     data: { flaggedAt: new Date() },
   });
 
-  return { pruned: pruneResult.count, flagged: flagResult.count };
+  const pruned = pruneResult.count;
+  const flagged = flagResult.count;
+
+  logger.info('Purge completed', { table: 'User', operation: 'deleteMany', count: pruned });
+  logger.info('Purge completed', { table: 'User', operation: 'updateMany', count: flagged });
+
+  return { pruned, flagged };
 }
 
 /**
@@ -72,9 +78,8 @@ function scheduleCleanupJob(prisma) {
     logger.info('[cleanup-cron] Starting stale-account sweep…');
     try {
       const { pruned, flagged } = await runCleanup(prisma);
-      logger.info(
-        `[cleanup-cron] Sweep complete – pruned: ${pruned}, flagged: ${flagged}`,
-      );
+      const total = pruned + flagged;
+      logger.info('[cleanup-cron] Sweep complete', { pruned, flagged, total });
     } catch (err) {
       logger.error('[cleanup-cron] Sweep failed:', err.message);
     }
