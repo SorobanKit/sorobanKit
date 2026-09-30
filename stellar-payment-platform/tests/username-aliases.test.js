@@ -141,6 +141,53 @@ describe('#613 username aliases', () => {
     });
   });
 
+  describe('GET /lookup?all=true returns all aliases', () => {
+    test('returns primary and all usernames for an address with multiple registrations', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        { username: 'payments*localhost' },
+        { username: 'savings*localhost' },
+        { username: 'trading*localhost' },
+      ]);
+
+      const res = await request(app).get('/lookup').query({ address: ADDRESS, all: 'true' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        address: ADDRESS,
+        primary: 'payments*localhost',
+        usernames: ['payments*localhost', 'savings*localhost', 'trading*localhost'],
+      });
+      const arg = prisma.user.findMany.mock.calls[0][0];
+      expect(arg.where).toMatchObject({ address: ADDRESS, deletedAt: null });
+    });
+
+    test('GET /lookup?address=...without all=true still returns single primary', async () => {
+      prisma.user.findFirst.mockResolvedValue({ username: 'payments*localhost' });
+
+      const res = await request(app).get('/lookup').query({ address: ADDRESS });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ username: 'payments*localhost', address: ADDRESS });
+    });
+
+    test('returns 404 when no usernames exist for address with all=true', async () => {
+      prisma.user.findMany.mockResolvedValue([]);
+
+      const res = await request(app).get('/lookup').query({ address: ADDRESS, all: 'true' });
+
+      expect(res.status).toBe(404);
+    });
+
+    test('soft-deleted usernames are excluded from all=true results', async () => {
+      prisma.user.findMany.mockResolvedValue([{ username: 'payments*localhost' }]);
+
+      await request(app).get('/lookup').query({ address: ADDRESS, all: 'true' });
+
+      const arg = prisma.user.findMany.mock.calls[0][0];
+      expect(arg.where).toMatchObject({ deletedAt: null });
+    });
+  });
+
   describe('GET /federation type=id returns the primary username', () => {
     test('resolves the address to its primary username, ordered primary-first', async () => {
       prisma.user.findFirst.mockResolvedValue({

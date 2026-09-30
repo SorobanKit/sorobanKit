@@ -290,7 +290,10 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 - `LOG_LEVEL` - (Optional) Minimum level to record. Defaults to `info` in production and `debug` elsewhere.
 - `LOG_MAX_SIZE` - (Optional) Size at which the active log file rotates. Defaults to `20m`.
 - `LOG_MAX_FILES` - (Optional) Retention for rotated files, as a count (`30`) or an age (`14d`). Defaults to `14d`.
-- `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). `warn` (default) logs a clear warning and continues; `strict` logs an error and exits non-zero before the server binds a port; `off` skips the check. Set to `strict` where you want deploys to fail fast on schema drift instead of failing on the first query.
+- `MIGRATION_POLICY` - (Optional) What to do at startup when `prisma migrate status` reports the database is out of sync (pending migrations or drift). Supported values:
+  - `warn` (default) — logs a clear warning and continues booting. Safe for local development with mock databases.
+  - `strict` — logs an error and calls `process.exit(1)` **before** `app.listen()` binds a port, so an orchestrator (Railway, Render, Kubernetes) sees a non-zero exit code and can restart a correctly-migrated instance. No port is bound and no HTTP requests are accepted while migrations are pending.
+  - `off` — skips the check entirely.
 
 For Render deployments, make sure the web service has `DATABASE_URL` set in its environment or linked from a Render PostgreSQL instance before startup. The container runs `prisma migrate deploy` during boot, so the variable must be available at runtime.
 

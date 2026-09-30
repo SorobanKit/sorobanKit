@@ -2528,6 +2528,65 @@ mod test {
         );
     }
 
+    /// When a recipient has no trustline (deauthorized on a Stellar Asset
+    /// Contract), `route_payment` must NOT abort.  Instead it should credit
+    /// the sender's refund ledger with the remainder and emit a "refunded"
+    /// event so the sender can later call `withdraw_refund`.
+    #[test]
+    fn test_route_payment_credits_refund_on_missing_trustline() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+
+        // Fund the sender.
+        let initial_balance = 10_000i128;
+        stellar_asset_client.mint(&sender, &initial_balance);
+
+        // Initialize with 1 % fee (100 bps), cap 50, and a large per-day limit.
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.add_supported_token(&token_address);
+
+        // Deauthorize the recipient's trustline so any transfer to them fails.
+        stellar_asset_client.set_authorized(&recipient, &false);
+
+        // route_payment must succeed (not abort).
+        let amount = 2_000i128;
+        client.route_payment(&sender, &recipient, &token_address, &amount);
+
+        // Fee (1 % of 2000 = 20) still reaches the treasury.
+        assert_eq!(token_client.balance(&treasury), 20);
+
+        // Recipient received nothing — trustline was deauthorized.
+        assert_eq!(token_client.balance(&recipient), 0);
+
+        // Remainder (1980) must be held by the contract.
+        let remainder = 1_980i128;
+        assert_eq!(token_client.balance(&contract_id), remainder);
+
+        // Sender's refund ledger must reflect the full remainder.
+        assert_eq!(client.get_refund_balance(&sender, &token_address), remainder);
+
+        // A "refunded" event must have been published.
+        let events = env.events().all();
+        let refunded_found = events.iter().any(|evt| {
+            let (_cid, topics, _data) = evt;
+            if topics.len() < 1 {
+                return false;
+            }
+            let t0: soroban_sdk::Symbol = match topics.get(0).unwrap().try_into_val(&env) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            t0 == symbol_short!("refunded")
+        });
+        assert!(refunded_found, "route_payment should publish a \"refunded\" event on trustline failure");
+    }
+
     #[test]
     #[ignore]
     fn test_refund_ledger_and_withdrawal() {
