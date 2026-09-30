@@ -62,13 +62,18 @@ const [activeView, setActiveView] = useState('dashboard')
     };
   }, []);
 
+  const WALLET_TIMEOUT_MS = 15_000;
+
   const handleConnectWallet = async () => {
     try {
       await walletKit.openModal({
         onWalletSelected: async (option) => {
           try {
             walletKit.setWallet(option.id);
-            const addressResponse = await walletKit.getAddress();
+            const timeoutPromise = new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Wallet connection timed out')), WALLET_TIMEOUT_MS)
+            );
+            const addressResponse = await Promise.race([walletKit.getAddress(), timeoutPromise]);
             
             // Extract the key carefully to avoid the initialization error
             const publicKey = typeof addressResponse === 'string' 

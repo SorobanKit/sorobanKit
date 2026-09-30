@@ -77,6 +77,30 @@ const buildDateFilter = (startDate, endDate) => {
  * @param {string} [opts.assetCode] - Optional asset filter.
  * @returns {Promise<object>} Grouped aggregation statistics and summary.
  */
+/**
+ * Snaps a date string to the Monday of its ISO week (for startDate) or the
+ * Sunday of its ISO week (for endDate). Without this, a weekly query with a
+ * date range that starts or ends mid-week produces partial week buckets near
+ * month boundaries, which look wrong in the response.
+ *
+ * @param {string} dateStr - YYYY-MM-DD
+ * @param {'start'|'end'} side
+ * @returns {string} Adjusted YYYY-MM-DD
+ */
+const snapToWeekBoundary = (dateStr, side) => {
+  const d = new Date(dateStr);
+  d.setUTCHours(0, 0, 0, 0);
+  const dow = d.getUTCDay(); // 0 = Sun, 1 = Mon, …, 6 = Sat
+  if (side === 'start') {
+    const daysBack = dow === 0 ? 6 : dow - 1;
+    if (daysBack > 0) d.setUTCDate(d.getUTCDate() - daysBack);
+  } else {
+    const daysForward = dow === 0 ? 0 : 7 - dow;
+    if (daysForward > 0) d.setUTCDate(d.getUTCDate() + daysForward);
+  }
+  return d.toISOString().slice(0, 10);
+};
+
 const getRoutingStats = async ({
   prisma,
   startDate,
@@ -86,8 +110,18 @@ const getRoutingStats = async ({
   assetCode,
 }) => {
   const selectedInterval = interval || groupBy || 'day';
+
+  // Snap date range to ISO week boundaries so weekly buckets near month
+  // boundaries contain the full week's data rather than a partial slice.
+  let effectiveStartDate = startDate;
+  let effectiveEndDate = endDate;
+  if (selectedInterval === 'week') {
+    if (effectiveStartDate) effectiveStartDate = snapToWeekBoundary(effectiveStartDate, 'start');
+    if (effectiveEndDate) effectiveEndDate = snapToWeekBoundary(effectiveEndDate, 'end');
+  }
+
   const where = {
-    ...buildDateFilter(startDate, endDate),
+    ...buildDateFilter(effectiveStartDate, effectiveEndDate),
   };
 
   if (assetCode) {
@@ -190,6 +224,7 @@ module.exports = {
   getRoutingStats,
   getBucketKey,
   buildDateFilter,
+  snapToWeekBoundary,
   fetchAdminStats,
   SERVER_START_TIME,
 };
