@@ -660,3 +660,6 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-64 -->
 - #64: registrationService.js does not trim whitespace from usernames before storage
+
+<!-- handsoff-issue-66 -->
+- #66: Missing OPTIONS preflight CORS response on admin endpoints returns 405
