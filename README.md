@@ -657,3 +657,6 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-110 -->
 - #110: webhookWorker.js does not emit notification when webhook is moved to DLQ
+
+<!-- handsoff-issue-35 -->
+- #35: stellarService.js does not handle Horizon 429 rate limits with backoff retry
