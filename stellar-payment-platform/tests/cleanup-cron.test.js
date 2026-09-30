@@ -37,6 +37,17 @@ describe('runCleanup', () => {
 
     expect(result).toEqual({ pruned: 3, flagged: 1 });
 
+    expect(logger.info).toHaveBeenCalledWith('Purge completed', {
+      table: 'User',
+      operation: 'deleteMany',
+      count: 3,
+    });
+    expect(logger.info).toHaveBeenCalledWith('Purge completed', {
+      table: 'User',
+      operation: 'updateMany',
+      count: 1,
+    });
+
     const deleteWhere = prisma.user.deleteMany.mock.calls[0][0].where;
     expect(deleteWhere.address.notIn).toEqual([
       'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
@@ -98,7 +109,21 @@ describe('scheduleCleanupJob', () => {
     await scheduledCallback();
 
     expect(prisma.user.deleteMany).toHaveBeenCalledTimes(1);
-    expect(logger.info).toHaveBeenCalledWith('[cleanup-cron] Sweep complete – pruned: 2, flagged: 1');
+    expect(logger.info).toHaveBeenCalledWith('Purge completed', {
+      table: 'User',
+      operation: 'deleteMany',
+      count: 2,
+    });
+    expect(logger.info).toHaveBeenCalledWith('Purge completed', {
+      table: 'User',
+      operation: 'updateMany',
+      count: 1,
+    });
+    expect(logger.info).toHaveBeenCalledWith('[cleanup-cron] Sweep complete', {
+      pruned: 2,
+      flagged: 1,
+      total: 3,
+    });
   });
 
   it('logs an error when the sweep fails', async () => {
