@@ -108,6 +108,24 @@ describe('E2E: Registration Flow', () => {
     mockDb.clear();
   });
 
+  it('concurrent requests for the same username result in one 201 and one 409', async () => {
+    const user = {
+      username: `${TEST_PREFIX}race`,
+      address: 'GRACETESTADDR1111111111111111111111111111111111111111111',
+    };
+
+    const [res1, res2] = await Promise.all([
+      request(app).post('/api/v1/register').send(user),
+      request(app).post('/api/v1/register').send(user),
+    ]);
+
+    const statuses = [res1.status, res2.status].sort();
+    expect(statuses).toEqual([201, 409]);
+
+    const conflictRes = res1.status === 409 ? res1 : res2;
+    expect(conflictRes.body.error.code).toBe('CONFLICT');
+  });
+
   it('should successfully register a new user and handle duplicate registration gracefully', async () => {
     // 1. Successful Registration
     const validUser = {

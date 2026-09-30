@@ -119,4 +119,38 @@ describe('GET /health', () => {
     expect(options.signal).toBeInstanceOf(AbortSignal);
     expect(options.signal.aborted).toBe(false);
   });
+
+  test('probes the URL from HORIZON_BASE env var when set', async () => {
+    const customUrl = 'https://horizon.custom-staging.example.com';
+    jest.resetModules();
+    process.env.HORIZON_BASE = customUrl;
+
+    // Re-require after setting the env var so the module picks up the new value.
+    const healthRoutesWithEnv = require('../src/routes/v1/healthRoutes');
+    const appWithEnv = express();
+    appWithEnv.use(healthRoutesWithEnv(redisClient));
+
+    await request(appWithEnv).get('/health');
+
+    expect(global.fetch).toHaveBeenCalledWith(customUrl, expect.anything());
+
+    delete process.env.HORIZON_BASE;
+    jest.resetModules();
+  });
+
+  test('falls back to the testnet URL when HORIZON_BASE is unset', async () => {
+    jest.resetModules();
+    delete process.env.HORIZON_BASE;
+
+    const healthRoutesDefault = require('../src/routes/v1/healthRoutes');
+    const appDefault = express();
+    appDefault.use(healthRoutesDefault(redisClient));
+
+    await request(appDefault).get('/health');
+
+    const [probedUrl] = global.fetch.mock.calls[0];
+    expect(probedUrl).toBe('https://horizon-testnet.stellar.org');
+
+    jest.resetModules();
+  });
 });

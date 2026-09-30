@@ -271,10 +271,20 @@ const buildApiKeys = () => {
 // Persistence
 // ---------------------------------------------------------------------------
 
-const isLocalDatabase = (url) => {
+// Default safe hostnames. Operators can extend this list via the
+// SEED_ALLOWED_HOSTS env var (comma-separated), e.g.
+//   SEED_ALLOWED_HOSTS=localhost,db,my-dev-box.internal
+const DEFAULT_ALLOWED_HOSTS = ['localhost', '127.0.0.1', '::1', 'postgres', 'db'];
+
+const isLocalDatabase = (url, env = process.env) => {
   try {
     const { hostname } = new URL(url);
-    return ['localhost', '127.0.0.1', '::1', 'postgres', 'db'].includes(hostname);
+    const extra = (env.SEED_ALLOWED_HOSTS || '')
+      .split(',')
+      .map((h) => h.trim())
+      .filter(Boolean);
+    const allowed = new Set([...DEFAULT_ALLOWED_HOSTS, ...extra]);
+    return allowed.has(hostname);
   } catch {
     return false;
   }
@@ -286,9 +296,10 @@ const assertSeedable = (env = process.env) => {
       'DATABASE_URL is not set. The seed needs a real database, see .env.example.',
     );
   }
-  if (!isLocalDatabase(env.DATABASE_URL) && env.SEED_ALLOW_REMOTE !== '1') {
+  if (!isLocalDatabase(env.DATABASE_URL, env) && env.SEED_ALLOW_REMOTE !== '1') {
     throw new Error(
-      'DATABASE_URL does not point at a local database. Set SEED_ALLOW_REMOTE=1 to override.',
+      'DATABASE_URL does not point at a local database (and is not in SEED_ALLOWED_HOSTS). ' +
+      'Set SEED_ALLOW_REMOTE=1 to override.',
     );
   }
 };
@@ -340,13 +351,8 @@ const writeSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys 
   }
 };
 
-const seedDatabase = async ({ reset = false } = {}) => {
+const seedDatabase = async ({ reset = false, dryRun = false } = {}) => {
   assertSeedable();
-
-  // Required after assertSeedable: importing earlier would bind the fallback
-  // mock in prismaClient when DATABASE_URL is missing, and the seed would
-  // report success while writing nothing.
-  const { prisma } = require('../prismaClient');
 
   const users = buildUsers();
   const data = {
@@ -355,6 +361,26 @@ const seedDatabase = async ({ reset = false } = {}) => {
     paymentIntents: buildPaymentIntents(users),
     apiKeys: buildApiKeys(),
   };
+
+  if (dryRun) {
+    logger.info('[seed] --dry-run: would upsert the following records (no writes performed):');
+    logger.info(`  ${data.users.length} users`);
+    logger.info(`  ${data.webhooks.length} webhooks`);
+    logger.info(`  ${data.paymentIntents.length} payment intents`);
+    logger.info(`  ${data.apiKeys.length} API keys`);
+    return;
+  }
+
+  logger.warn(
+    '⚠ WARNING: This will modify the database at ' +
+      (process.env.DATABASE_URL || '(DATABASE_URL not set)') +
+      '. Press Ctrl-C within 5 seconds to abort.',
+  );
+
+  // Required after assertSeedable: importing earlier would bind the fallback
+  // mock in prismaClient when DATABASE_URL is missing, and the seed would
+  // report success while writing nothing.
+  const { prisma } = require('../prismaClient');
 
   try {
     if (reset) {
@@ -378,7 +404,10 @@ const seedDatabase = async ({ reset = false } = {}) => {
 };
 
 if (require.main === module) {
-  seedDatabase({ reset: process.argv.includes('--reset') }).catch((error) => {
+  seedDatabase({
+    reset: process.argv.includes('--reset'),
+    dryRun: process.argv.includes('--dry-run'),
+  }).catch((error) => {
     logger.error(error, 'Seeding failed');
     process.exitCode = 1;
   });
@@ -394,6 +423,7 @@ module.exports = {
   assertSeedable,
   isLocalDatabase,
   seedDatabase,
+  DEFAULT_ALLOWED_HOSTS,
   USER_COUNT,
   WEBHOOK_COUNT,
   PAYMENT_INTENT_COUNT,

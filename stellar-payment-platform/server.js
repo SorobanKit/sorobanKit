@@ -467,22 +467,27 @@ const listLocalUsers = async (search, page, limit, cursorPoint = null) => {
 };
 
 const registerLocalUser = async ({ username, address, isPrimary = false }) => {
-  // #613 — several usernames may share an address, so an existing address is
-  // no longer a conflict; only a duplicate username is.
-  const existingByUsername = await getLocalUserByUsername(username);
-  if (existingByUsername) {
-    const conflictError = new Error(
-      "Username is already taken. Please choose another.",
+  // Rely on the UNIQUE constraint on username_registry.username rather than a
+  // pre-check SELECT so concurrent requests cannot both pass the existence check
+  // and then race to insert, producing a duplicate or an unhandled error.
+  try {
+    await poolRun(
+      `INSERT INTO username_registry (username, address, created_at)
+       VALUES ($1, $2, $3)`,
+      [username, address, new Date().toISOString()],
     );
-    conflictError.statusCode = 409;
-    throw conflictError;
+  } catch (err) {
+    // 23505 = PostgreSQL unique_violation; SQLITE_CONSTRAINT covers SQLite.
+    if (err.code === '23505' || err.code === 'SQLITE_CONSTRAINT' ||
+        (err.message && err.message.includes('UNIQUE'))) {
+      const conflictError = new Error(
+        'Username is already taken. Please choose another.',
+      );
+      conflictError.statusCode = 409;
+      throw conflictError;
+    }
+    throw err;
   }
-
-  await poolRun(
-    `INSERT INTO username_registry (username, address, created_at)
-     VALUES ($1, $2, $3)`,
-    [username, address, new Date().toISOString()],
-  );
 };
 
 // Expose /metrics endpoint for Prometheus to scrape

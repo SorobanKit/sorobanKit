@@ -25,6 +25,7 @@ const {
   resetSeedData,
   assertSeedable,
   isLocalDatabase,
+  DEFAULT_ALLOWED_HOSTS,
   USER_COUNT,
   WEBHOOK_COUNT,
   PAYMENT_INTENT_COUNT,
@@ -299,10 +300,14 @@ describe('assertSeedable', () => {
     expect(() => assertSeedable({})).toThrow(/DATABASE_URL is not set/);
   });
 
-  test('rejects a non-local database unless explicitly allowed', () => {
+  test('rejects a non-local database without SEED_ALLOW_REMOTE=1', () => {
     const remote = { DATABASE_URL: 'postgresql://u:p@db.example.com:5432/prod' };
     expect(() => assertSeedable(remote)).toThrow(/SEED_ALLOW_REMOTE/);
-    expect(() => assertSeedable({ ...remote, SEED_ALLOW_REMOTE: '1' })).not.toThrow();
+  });
+
+  test('allows a remote database when SEED_ALLOW_REMOTE=1 is set', () => {
+    const remote = { DATABASE_URL: 'postgresql://u:p@db.example.com:5432/prod', SEED_ALLOW_REMOTE: '1' };
+    expect(() => assertSeedable(remote)).not.toThrow();
   });
 
   test('accepts the local URLs from .env.example and docker-compose', () => {
@@ -310,5 +315,32 @@ describe('assertSeedable', () => {
     expect(isLocalDatabase('postgresql://postgres:postgres@postgres:5432/stellar_tags')).toBe(true);
     expect(isLocalDatabase('postgresql://u:p@db.example.com:5432/prod')).toBe(false);
     expect(isLocalDatabase('not a url')).toBe(false);
+  });
+
+  test('DEFAULT_ALLOWED_HOSTS contains the standard local hostnames', () => {
+    for (const host of ['localhost', '127.0.0.1', '::1', 'postgres', 'db']) {
+      expect(DEFAULT_ALLOWED_HOSTS).toContain(host);
+    }
+  });
+
+  test('SEED_ALLOWED_HOSTS extends the allowlist so custom dev hosts pass', () => {
+    const url = 'postgresql://u:p@my-dev-box.internal:5432/dev';
+    expect(isLocalDatabase(url, {})).toBe(false);
+    expect(isLocalDatabase(url, { SEED_ALLOWED_HOSTS: 'my-dev-box.internal' })).toBe(true);
+  });
+
+  test('SEED_ALLOWED_HOSTS accepts a comma-separated list', () => {
+    const url = 'postgresql://u:p@staging.internal:5432/dev';
+    expect(
+      isLocalDatabase(url, { SEED_ALLOWED_HOSTS: 'dev1.internal, staging.internal, dev2.internal' }),
+    ).toBe(true);
+  });
+
+  test('rejects a remote URL not in SEED_ALLOWED_HOSTS without SEED_ALLOW_REMOTE', () => {
+    const env = {
+      DATABASE_URL: 'postgresql://u:p@prod.example.com:5432/prod',
+      SEED_ALLOWED_HOSTS: 'staging.example.com',
+    };
+    expect(() => assertSeedable(env)).toThrow(/SEED_ALLOW_REMOTE/);
   });
 });
