@@ -10,17 +10,20 @@
 
 const helmet = require('helmet');
 
+// API-only service: block every resource type by default. Explicit allowances
+// (script-src, style-src, etc.) are intentionally absent because no HTML is
+// served and no browser will render a page from this origin.
 const cspDirectives = {
-  defaultSrc: ["'self'"],
-  scriptSrc: ["'self'"],
-  styleSrc: ["'self'"],
-  imgSrc: ["'self'", 'data:', 'https:'],
-  fontSrc: ["'self'"],
+  defaultSrc: ["'none'"],
+  scriptSrc: ["'none'"],
+  styleSrc: ["'none'"],
+  imgSrc: ["'none'"],
+  fontSrc: ["'none'"],
   objectSrc: ["'none'"],
-  mediaSrc: ["'self'"],
+  mediaSrc: ["'none'"],
   frameAncestors: ["'none'"],
-  baseUri: ["'self'"],
-  formAction: ["'self'"],
+  baseUri: ["'none'"],
+  formAction: ["'none'"],
 };
 
 const helmetMiddleware = helmet({

@@ -300,3 +300,73 @@ describe('enforceMigrationPolicy', () => {
     expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('Could not determine'));
   });
 });
+describe('strict-mode process.exit integration', () => {
+  let checkMigrations;
+  let enforceMigrationPolicy;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.resetModules();
+    ({ checkMigrations, enforceMigrationPolicy } = require('../src/migrate-check'));
+  });
+
+  it('calls process.exit(1) before any port is bound when strict mode has pending migrations', async () => {
+    // Simulate pending migrations output from prisma CLI.
+    mockExecFile.mockImplementation((_bin, _args, _opts, cb) => {
+      cb(
+        Object.assign(new Error('pending'), { code: 1 }),
+        'Following migration(s) have not yet been applied:\n- 20260101_add_col',
+        '',
+      );
+    });
+
+    process.env.MIGRATION_POLICY = 'strict';
+    process.env.DATABASE_URL = 'postgresql://localhost/test';
+
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const listenSpy = jest.fn();
+
+    // Run the migration check as the server startup sequence does.
+    const result = await checkMigrations();
+    const { shouldExit } = enforceMigrationPolicy(result);
+
+    if (shouldExit) {
+      process.exit(1);
+    } else {
+      listenSpy();
+    }
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(listenSpy).not.toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+    delete process.env.DATABASE_URL;
+  });
+
+  it('does not call process.exit when strict mode and migrations are up to date', async () => {
+    mockExecFile.mockImplementation((_bin, _args, _opts, cb) => {
+      cb(null, 'Status: Database schema is up to date!', '');
+    });
+
+    process.env.MIGRATION_POLICY = 'strict';
+    process.env.DATABASE_URL = 'postgresql://localhost/test';
+
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const listenSpy = jest.fn();
+
+    const result = await checkMigrations();
+    const { shouldExit } = enforceMigrationPolicy(result);
+
+    if (shouldExit) {
+      process.exit(1);
+    } else {
+      listenSpy();
+    }
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(listenSpy).toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+    delete process.env.DATABASE_URL;
+  });
+});

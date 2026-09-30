@@ -508,10 +508,29 @@ router.get(
   etagCache,
   validateSchema({ query: lookupQuerySchema }),
   asyncHandler(async (req, res, next) => {
-    const { address = "", search = "" } = req.query;
+    const { address = "", search = "", all = false } = req.query;
 
     if (address) {
       try {
+        if (all) {
+          // Return all non-deleted usernames for this address plus the primary.
+          const rows = await prisma.user.findMany({
+            where: { address, deletedAt: null },
+            select: { username: true },
+            orderBy: PRIMARY_USERNAME_ORDER,
+          });
+          if (!rows.length) {
+            const notFoundError = new Error("Username not found for this address");
+            notFoundError.statusCode = 404;
+            return next(notFoundError);
+          }
+          return res.json({
+            address,
+            primary: rows[0].username,
+            usernames: rows.map((r) => r.username),
+          });
+        }
+
         const result = await lookupCached(address, async () => {
           // #613 — an address can have several usernames; return the primary.
           const row = await prisma.user.findFirst({

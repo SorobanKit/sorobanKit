@@ -141,6 +141,10 @@ const lookupQuerySchema = z
   .object({
     address: optionalLookupString,
     search: optionalLookupString,
+    all: z
+      .enum(['true', 'false'])
+      .optional()
+      .transform((v) => v === 'true'),
     ...paginationFields,
     ...cursorField,
   })
