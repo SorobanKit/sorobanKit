@@ -657,3 +657,6 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-110 -->
 - #110: webhookWorker.js does not emit notification when webhook is moved to DLQ
+
+<!-- handsoff-issue-64 -->
+- #64: registrationService.js does not trim whitespace from usernames before storage
