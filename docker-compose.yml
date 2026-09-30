@@ -18,7 +18,7 @@ services:
   # ── dev ────────────────────────────────────────────────────────────────────
   postgres:
     profiles: ["dev", "full"]
-    image: postgres:16-alpine
+    image: postgres:16.9-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -86,7 +86,7 @@ services:
   # ── test ───────────────────────────────────────────────────────────────────
   postgres-test:
     profiles: ["test"]
-    image: postgres:16-alpine
+    image: postgres:16.9-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

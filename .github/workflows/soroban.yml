@@ -35,6 +35,7 @@ jobs:
 
   bindings-check:
     name: Bindings up-to-date
+    needs: contract-checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code

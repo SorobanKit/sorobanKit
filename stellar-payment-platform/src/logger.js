@@ -31,6 +31,17 @@ const logger = pino({
       return { level: label };
     },
   },
+  // Redact sensitive fields at the pino level so they never reach log files,
+  // log aggregators, or stdout regardless of call site.
+  redact: {
+    paths: [
+      'password', 'secret', 'token', 'authorization', 'x-api-key',
+      '*.password', '*.secret', '*.token', '*.authorization', '*.x-api-key',
+      'body.password', 'body.secret', 'body.token',
+      'headers.authorization', 'headers.x-api-key',
+    ],
+    censor: '[REDACTED]',
+  },
 });
 
 const redactSensitive = (obj) => {

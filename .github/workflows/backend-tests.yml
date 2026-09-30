@@ -13,6 +13,21 @@ jobs:
       matrix:
         node-version: [20]
 
+    services:
+      postgres:
+        image: postgres:16.9-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stellar_tags_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,6 +47,8 @@ jobs:
       # no database reset.
       - name: Run backend unit tests (with coverage thresholds)
         run: npm run test:coverage --prefix stellar-payment-platform
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
 
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
