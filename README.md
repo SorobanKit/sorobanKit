@@ -658,5 +658,11 @@ See [LICENSE](LICENSE).
 <!-- handsoff-issue-110 -->
 - #110: webhookWorker.js does not emit notification when webhook is moved to DLQ
 
-<!-- handsoff-issue-35 -->
-- #35: stellarService.js does not handle Horizon 429 rate limits with backoff retry
+<!-- handsoff-issue-64 -->
+- #64: registrationService.js does not trim whitespace from usernames before storage
+
+<!-- handsoff-issue-66 -->
+- #66: Missing OPTIONS preflight CORS response on admin endpoints returns 405
+
+<!-- handsoff-issue-67 -->
+- #67: Soroban contract does not enforce a minimum payment amount (allows amount=0)
