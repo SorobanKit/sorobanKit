@@ -119,11 +119,13 @@ const listActivity = async (prisma, { username, page = 1, limit = DEFAULT_PAGE_S
   return { rows, total };
 };
 
+// ip_address is intentionally excluded: admin-initiated actions (e.g. blocks)
+// are recorded under the target user's trail with the admin's IP, which would
+// leak the admin's address to the user viewing their own activity.
 const serializeActivity = (row) => ({
   id: row.id,
   action: row.action,
   metadata: row.metadata ?? null,
-  ip_address: row.ipAddress ?? null,
   created_at: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt,
 });
 

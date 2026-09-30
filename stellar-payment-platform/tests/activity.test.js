@@ -185,7 +185,7 @@ describe('listActivity', () => {
 });
 
 describe('serializeActivity', () => {
-  test('exposes snake_case fields and an ISO timestamp', () => {
+  test('exposes snake_case fields and an ISO timestamp without ip_address', () => {
     const createdAt = new Date('2026-03-04T05:06:07.000Z');
     expect(
       serializeActivity({
@@ -199,21 +199,23 @@ describe('serializeActivity', () => {
       id: 'row-1',
       action: 'webhook.created',
       metadata: { url: 'https://example.test' },
-      ip_address: '10.0.0.9',
       created_at: '2026-03-04T05:06:07.000Z',
     });
   });
 
-  test('normalises absent metadata and IP to null', () => {
+  test('does not expose ip_address (prevents admin IP leak to blocked users)', () => {
+    // Admin-initiated actions (e.g. user.blocked) are stored under the target
+    // user's activity trail with the ADMIN's IP. Returning ip_address in the
+    // API response would therefore leak the admin's IP to the target user.
     const row = serializeActivity({
       id: 'row-2',
       action: 'user.blocked',
       metadata: null,
-      ipAddress: null,
+      ipAddress: '192.168.1.1',
       createdAt: new Date(0),
     });
+    expect(row).not.toHaveProperty('ip_address');
     expect(row.metadata).toBeNull();
-    expect(row.ip_address).toBeNull();
   });
 
   test('never leaks the raw username of the row', () => {

@@ -50,7 +50,7 @@ process.env.ADMIN_API_KEY = 'test-admin-key';
 
 // Load app after mocks are in place.
 const { app } = require('../server');
-const { getBucketKey, buildDateFilter } = require('../src/services/statsService');
+const { getBucketKey, buildDateFilter, snapToWeekBoundary } = require('../src/services/statsService');
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -285,6 +285,51 @@ describe('GET /admin/stats/routing', () => {
       const filtered = buildDateFilter('2026-08-01', '2026-08-15');
       expect(filtered.createdAt.gte.toISOString()).toBe('2026-08-01T00:00:00.000Z');
       expect(filtered.createdAt.lte.toISOString()).toBe('2026-08-15T23:59:59.999Z');
+    });
+
+    it('snapToWeekBoundary: start snaps a mid-week date back to Monday', () => {
+      // 2026-09-01 is a Tuesday — should snap back to Monday 2026-08-31
+      expect(snapToWeekBoundary('2026-09-01', 'start')).toBe('2026-08-31');
+    });
+
+    it('snapToWeekBoundary: start is a no-op for a Monday', () => {
+      expect(snapToWeekBoundary('2026-08-31', 'start')).toBe('2026-08-31');
+    });
+
+    it('snapToWeekBoundary: start snaps Sunday back six days to Monday', () => {
+      // 2026-09-06 is a Sunday — week started Mon 2026-08-31
+      expect(snapToWeekBoundary('2026-09-06', 'start')).toBe('2026-08-31');
+    });
+
+    it('snapToWeekBoundary: end snaps a mid-week date forward to Sunday', () => {
+      // 2026-09-30 is a Wednesday — should snap forward to Sunday 2026-10-04
+      expect(snapToWeekBoundary('2026-09-30', 'end')).toBe('2026-10-04');
+    });
+
+    it('snapToWeekBoundary: end is a no-op for a Sunday', () => {
+      expect(snapToWeekBoundary('2026-10-04', 'end')).toBe('2026-10-04');
+    });
+
+    it('weekly groupBy with month-crossing startDate fetches from Monday of that week', async () => {
+      mockFindMany.mockResolvedValueOnce([]);
+
+      // 2026-09-01 is Tuesday; the Monday is 2026-08-31
+      await request(app)
+        .get('/api/v1/admin/stats/routing?startDate=2026-09-01&groupBy=week')
+        .set('x-api-key', 'test-admin-key');
+
+      expect(mockFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            createdAt: expect.objectContaining({
+              gte: expect.any(Date),
+            }),
+          }),
+        }),
+      );
+      // The gte date should have been expanded to 2026-08-31
+      const call = mockFindMany.mock.calls[0][0];
+      expect(call.where.createdAt.gte.toISOString().slice(0, 10)).toBe('2026-08-31');
     });
   });
 });
