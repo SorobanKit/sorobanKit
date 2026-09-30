@@ -663,3 +663,6 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-66 -->
 - #66: Missing OPTIONS preflight CORS response on admin endpoints returns 405
+
+<!-- handsoff-issue-67 -->
+- #67: Soroban contract does not enforce a minimum payment amount (allows amount=0)
