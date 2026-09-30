@@ -68,6 +68,53 @@ describe('jwt utils (configured keys)', () => {
       const tampered = `${header}.${payload}.${signature.slice(0, -1)}a`;
       expect(() => jwtUtils.verifyToken(tampered)).toThrow();
     });
+
+    it('sets iss and aud claims when signing a token', () => {
+      const token = jwtUtils.signToken({ username: 'alice' });
+      const decoded = jwtUtils.verifyToken(token);
+      expect(decoded.iss).toBe('stellar-payment-platform');
+      expect(decoded.aud).toBe('api');
+    });
+
+    it('rejects a token without iss claim with UNAUTHENTICATED', () => {
+      const rawJwt = require('jsonwebtoken');
+      const tokenWithoutIss = rawJwt.sign({ username: 'alice', aud: 'api' }, PRIVATE_PEM, {
+        algorithm: 'RS256',
+        expiresIn: '1h',
+      });
+      expect(() => jwtUtils.verifyToken(tokenWithoutIss)).toThrow('UNAUTHENTICATED');
+    });
+
+    it('rejects a token with mismatched iss claim with UNAUTHENTICATED', () => {
+      const tokenWrongIss = jwtUtils.signToken({ username: 'alice' }, { issuer: 'other-service' });
+      expect(() => jwtUtils.verifyToken(tokenWrongIss)).toThrow('UNAUTHENTICATED');
+    });
+
+    it('rejects a token without aud claim with UNAUTHENTICATED', () => {
+      const rawJwt = require('jsonwebtoken');
+      const tokenWithoutAud = rawJwt.sign(
+        { username: 'alice', iss: 'stellar-payment-platform' },
+        PRIVATE_PEM,
+        {
+          algorithm: 'RS256',
+          expiresIn: '1h',
+        },
+      );
+      expect(() => jwtUtils.verifyToken(tokenWithoutAud)).toThrow('UNAUTHENTICATED');
+    });
+
+    it('rejects a token with wrong aud claim with UNAUTHENTICATED', () => {
+      const tokenWrongAud = jwtUtils.signToken({ username: 'alice' }, { audience: 'wrong-audience' });
+      expect(() => jwtUtils.verifyToken(tokenWrongAud)).toThrow('UNAUTHENTICATED');
+    });
+
+    it('verifies a valid token with correct iss and aud claims', () => {
+      const token = jwtUtils.signToken({ username: 'alice' });
+      const decoded = jwtUtils.verifyToken(token);
+      expect(decoded.username).toBe('alice');
+      expect(decoded.iss).toBe('stellar-payment-platform');
+      expect(decoded.aud).toBe('api');
+    });
   });
 
   describe('getJwks', () => {
@@ -142,6 +189,19 @@ describe('jwt utils (configured keys)', () => {
 
       expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({ error: 'Invalid token.' });
+    });
+
+    it('rejects a token with mismatched claims with 401 and UNAUTHENTICATED', () => {
+      const tokenWrongIss = jwtUtils.signToken({ username: 'bob' }, { issuer: 'other-service' });
+      const req = { headers: { authorization: `Bearer ${tokenWrongIss}` } };
+      const res = fakeRes();
+      const next = jest.fn();
+
+      jwtUtils.requireAuth(req, res, next);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith({ error: 'UNAUTHENTICATED' });
+      expect(next).not.toHaveBeenCalled();
     });
   });
 });

@@ -31,6 +31,8 @@ const PRIVATE_KEY = normalizeKey(process.env.JWT_PRIVATE_KEY);
 const PUBLIC_KEY = normalizeKey(process.env.JWT_PUBLIC_KEY);
 
 const DEFAULT_EXPIRY = process.env.JWT_EXPIRY || '1h';
+const DEFAULT_ISSUER = 'stellar-payment-platform';
+const DEFAULT_AUDIENCE = 'api';
 
 // ---------------------------------------------------------------------------
 // Sign
@@ -51,6 +53,8 @@ function signToken(payload, options = {}) {
   return jwt.sign(payload, PRIVATE_KEY, {
     algorithm: 'RS256',
     expiresIn: DEFAULT_EXPIRY,
+    issuer: DEFAULT_ISSUER,
+    audience: DEFAULT_AUDIENCE,
     ...options,
   });
 }
@@ -63,15 +67,37 @@ function signToken(payload, options = {}) {
  * Verify and decode a JWT using the RSA public key.
  *
  * @param {string} token - JWT string to verify.
+ * @param {object} [options] - Optional jsonwebtoken verify options.
  * @returns {object} Decoded payload.
  * @throws {JsonWebTokenError|TokenExpiredError} on invalid / expired tokens.
  */
-function verifyToken(token) {
+function verifyToken(token, options = {}) {
   if (!PUBLIC_KEY) {
     throw new Error('JWT_PUBLIC_KEY is not configured.');
   }
 
-  return jwt.verify(token, PUBLIC_KEY, { algorithms: ['RS256'] });
+  try {
+    return jwt.verify(token, PUBLIC_KEY, {
+      algorithms: ['RS256'],
+      issuer: DEFAULT_ISSUER,
+      audience: DEFAULT_AUDIENCE,
+      ...options,
+    });
+  } catch (err) {
+    if (
+      err.name === 'JsonWebTokenError' &&
+      (err.message.includes('jwt issuer invalid') ||
+        err.message.includes('jwt audience invalid') ||
+        err.message.includes('issuer') ||
+        err.message.includes('audience'))
+    ) {
+      const authErr = new Error('UNAUTHENTICATED');
+      authErr.name = 'JsonWebTokenError';
+      authErr.code = 'UNAUTHENTICATED';
+      throw authErr;
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,10 +157,20 @@ function requireAuth(req, res, next) {
     req.user = verifyToken(token);
     return next();
   } catch (err) {
+    if (err.message === 'UNAUTHENTICATED' || err.code === 'UNAUTHENTICATED') {
+      return res.status(401).json({ error: 'UNAUTHENTICATED' });
+    }
     const message =
       err.name === 'TokenExpiredError' ? 'Token has expired.' : 'Invalid token.';
     return res.status(401).json({ error: message });
   }
 }
 
-module.exports = { signToken, verifyToken, getJwks, requireAuth };
+module.exports = {
+  signToken,
+  verifyToken,
+  getJwks,
+  requireAuth,
+  DEFAULT_ISSUER,
+  DEFAULT_AUDIENCE,
+};
