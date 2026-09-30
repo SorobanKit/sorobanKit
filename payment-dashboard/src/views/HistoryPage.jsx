@@ -16,13 +16,19 @@ function HistoryPage({
   onRegisterClick,
   canRegister,
 }) {
+  const PAGE_LIMIT = 20;
+
   const [isNavOpen, setIsNavOpen] = useNavState();
   const [isConnecting, setIsConnecting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [history, setHistory] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [refreshIndex, setRefreshIndex] = useState(0);
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
+  const [cursor, setCursor] = useState(null);
   const {
     menuRef,
     isOpen: isWalletMenuOpen,
@@ -54,25 +60,36 @@ function HistoryPage({
   };
 
   const loadHistory = useCallback(
-    async (signal) => {
+    async (signal, { append = false, nextCursor = null } = {}) => {
       if (!userPublicKey) {
         return;
       }
 
       await Promise.resolve();
-      setIsLoading(true);
+      if (append) {
+        setIsLoadingMore(true);
+      } else {
+        setIsLoading(true);
+        setHistory([]);
+        setCursor(null);
+        setHasMore(false);
+      }
       setHistoryError("");
       try {
-        const response = await fetch(
-          `${HORIZON_BASE}/accounts/${userPublicKey}/payments?order=desc&limit=25`,
-          { signal, cache: "no-store" },
-        );
+        const url = nextCursor
+          ? `${HORIZON_BASE}/accounts/${userPublicKey}/payments?order=desc&limit=${PAGE_LIMIT}&cursor=${encodeURIComponent(nextCursor)}`
+          : `${HORIZON_BASE}/accounts/${userPublicKey}/payments?order=desc&limit=${PAGE_LIMIT}`;
+        const response = await fetch(url, { signal, cache: "no-store" });
         if (!response.ok) {
           throw new Error(`Horizon error (${response.status}).`);
         }
 
         const data = await response.json();
         const records = data?._embedded?.records ?? [];
+        const nextLink = data?._links?.next?.href ?? null;
+        const nextPageCursor = nextLink
+          ? new URL(nextLink).searchParams.get("cursor")
+          : null;
         const filtered = records.filter((record) =>
           [
             "payment",
@@ -180,7 +197,13 @@ function HistoryPage({
           }
         }
 
-        setHistory(formatted);
+        setCursor(nextPageCursor);
+        setHasMore(Boolean(nextPageCursor));
+        if (append) {
+          setHistory((prev) => [...prev, ...formatted]);
+        } else {
+          setHistory(formatted);
+        }
       } catch (error) {
         if (error.name !== "AbortError") {
           setHistoryError(
@@ -189,10 +212,17 @@ function HistoryPage({
         }
       } finally {
         setIsLoading(false);
+        setIsLoadingMore(false);
       }
     },
-    [onRefreshBalance, userPublicKey],
+    [onRefreshBalance, userPublicKey, PAGE_LIMIT],
   );
+
+  const handleLoadMore = () => {
+    const controller = new AbortController();
+    setPage((p) => p + 1);
+    loadHistory(controller.signal, { append: true, nextCursor: cursor });
+  };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -346,8 +376,10 @@ function HistoryPage({
               </button>
             </div>
           )}
-          {userPublicKey && isLoading && (
-            <div className="wallet-status">Loading transactions...</div>
+          {userPublicKey && (isLoading || isLoadingMore) && (
+            <div className="wallet-status" aria-live="polite">
+              {isLoading ? "Loading transactions..." : "Loading more..."}
+            </div>
           )}
           {userPublicKey && historyError && (
             <div className="wallet-status">{historyError}</div>
@@ -439,6 +471,18 @@ function HistoryPage({
                 </tbody>
               </table>
             )}
+          {userPublicKey && !isLoading && !historyError && hasMore && (
+            <div className="load-more-row">
+              <button
+                type="button"
+                className="load-more-button"
+                onClick={handleLoadMore}
+                disabled={isLoadingMore}
+              >
+                {isLoadingMore ? "Loading..." : "Load more"}
+              </button>
+            </div>
+          )}
         </section>
       </main>
       <MobileNav
