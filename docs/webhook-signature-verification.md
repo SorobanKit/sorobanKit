@@ -8,20 +8,23 @@ been tampered with in transit.
 
 | Header | Description |
 |---|---|
-| `X-Webhook-Signature` | Hex-encoded HMAC-SHA256 of the raw JSON body, signed with the webhook secret. |
+| `X-Webhook-Signature` | Hex-encoded HMAC-SHA256 of `"<unix_ts>.<raw JSON body>"`, signed with the webhook secret. |
 | `X-Stellar-Tags-Signature` | Alias for `X-Webhook-Signature` — kept for backward compatibility. |
-| `X-Webhook-Timestamp` | ISO 8601 timestamp (`payload.timestamp`) included in the signed body. |
+| `X-Webhook-Timestamp` | Unix timestamp (seconds since epoch) of the delivery. Included in the signed string to prevent replay attacks. |
 
 > Prefer `X-Webhook-Signature` for new integrations.
 
 ## How the signature is computed
 
 ```
-HMAC-SHA256( key=<webhook_secret>, message=<raw JSON body> )
+signed_string = unix_timestamp + "." + raw_JSON_body
+HMAC-SHA256( key=<webhook_secret>, message=<signed_string> )
 ```
 
-The raw JSON body is the exact byte sequence sent over the wire.  
-The webhook secret is the value you supplied when registering your webhook URL.
+`unix_timestamp` is the value of the `X-Webhook-Timestamp` header (an integer number
+of seconds since the Unix epoch).  The raw JSON body is the exact byte sequence sent
+over the wire.  The webhook secret is the value you supplied when registering your
+webhook URL.
 
 ## Test verification endpoint
 
@@ -62,16 +65,18 @@ error payload including the expected and received values.
 const crypto = require('crypto');
 
 /**
- * Returns true when the request body matches the signature.
+ * Returns true when the timestamp + body match the signature.
  *
  * @param {string} secret      - The webhook secret you registered.
+ * @param {string} timestamp   - Value of the X-Webhook-Timestamp header.
  * @param {string} rawBody     - The raw request body (Buffer or string).
  * @param {string} sigHeader   - Value of the X-Webhook-Signature header.
  */
-function verifySignature(secret, rawBody, sigHeader) {
+function verifySignature(secret, timestamp, rawBody, sigHeader) {
+  const signedString = `${timestamp}.${rawBody}`;
   const expected = crypto
     .createHmac('sha256', secret)
-    .update(rawBody)
+    .update(signedString)
     .digest('hex');
 
   // Constant-time comparison prevents timing-oracle attacks.
@@ -84,7 +89,13 @@ function verifySignature(secret, rawBody, sigHeader) {
 // Express example ─ use express.raw() to keep the body as a Buffer.
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   const sig = req.headers['x-webhook-signature'];
-  if (!sig || !verifySignature(process.env.WEBHOOK_SECRET, req.body, sig)) {
+  const ts = req.headers['x-webhook-timestamp'];
+
+  // Reject deliveries older than 5 minutes to prevent replay attacks.
+  if (!ts || Math.abs(Date.now() / 1000 - Number(ts)) > 300) {
+    return res.status(401).json({ error: 'Timestamp missing or too old' });
+  }
+  if (!sig || !verifySignature(process.env.WEBHOOK_SECRET, ts, req.body, sig)) {
     return res.status(401).json({ error: 'Invalid signature' });
   }
 
@@ -100,6 +111,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
 import hashlib
 import hmac
 import json
+import time
 from flask import Flask, request, abort
 
 app = Flask(__name__)
@@ -109,8 +121,14 @@ WEBHOOK_SECRET = b"your_webhook_secret"
 def webhook():
     raw_body = request.get_data()  # keep raw bytes before parsing
     sig = request.headers.get("X-Webhook-Signature", "")
+    ts = request.headers.get("X-Webhook-Timestamp", "")
 
-    expected = hmac.new(WEBHOOK_SECRET, raw_body, hashlib.sha256).hexdigest()
+    # Reject deliveries older than 5 minutes.
+    if not ts or abs(time.time() - int(ts)) > 300:
+        abort(401, "Timestamp missing or too old")
+
+    signed_string = f"{ts}.".encode() + raw_body
+    expected = hmac.new(WEBHOOK_SECRET, signed_string, hashlib.sha256).hexdigest()
     # hmac.compare_digest performs a constant-time comparison, preventing
     # timing attacks that could otherwise leak the expected signature byte by byte.
     if not hmac.compare_digest(expected, sig):
@@ -130,13 +148,18 @@ import (
     "crypto/hmac"
     "crypto/sha256"
     "encoding/hex"
+    "fmt"
     "io"
     "net/http"
+    "strconv"
+    "time"
 )
 
-func verifySignature(secret, rawBody []byte, sigHeader string) bool {
+func verifySignature(secret []byte, timestamp, rawBody []byte, sigHeader string) bool {
+    signed := append(timestamp, '.')
+    signed = append(signed, rawBody...)
     mac := hmac.New(sha256.New, secret)
-    mac.Write(rawBody)
+    mac.Write(signed)
     expected := hex.EncodeToString(mac.Sum(nil))
     // hmac.Equal performs a constant-time comparison, preventing timing
     // attacks that could otherwise leak the expected signature byte by byte.
@@ -147,13 +170,25 @@ func verifySignature(secret, rawBody []byte, sigHeader string) bool {
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
     body, _ := io.ReadAll(r.Body)
     sig := r.Header.Get("X-Webhook-Signature")
+    tsStr := r.Header.Get("X-Webhook-Timestamp")
 
-    if !verifySignature([]byte("your_webhook_secret"), body, sig) {
+    ts, err := strconv.ParseInt(tsStr, 10, 64)
+    if err != nil || abs64(time.Now().Unix()-ts) > 300 {
+        http.Error(w, "Timestamp missing or too old", http.StatusUnauthorized)
+        return
+    }
+
+    if !verifySignature([]byte("your_webhook_secret"), []byte(tsStr), body, sig) {
         http.Error(w, "Invalid signature", http.StatusUnauthorized)
         return
     }
     // process payload ...
     w.WriteHeader(http.StatusOK)
+}
+
+func abs64(n int64) int64 {
+    if n < 0 { return -n }
+    return n
 }
 ```
 
@@ -163,28 +198,33 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 - Use **`timingSafeEqual`** (or `hmac.compare_digest` in Python, `hmac.Equal`
   in Go) — regular string equality is vulnerable to timing attacks.
 - Rotate your webhook secret immediately if you suspect it has been leaked.
-- Optionally reject requests whose `X-Webhook-Timestamp` is more than five
-  minutes in the past to defend against replay attacks.
+- **Always reject** requests whose `X-Webhook-Timestamp` is more than five
+  minutes in the past — the timestamp is now part of the signature so replayed
+  requests will fail verification after the window closes.
 
-## Replay-attack guard (optional)
+## Replay-attack guard
+
+Because `X-Webhook-Timestamp` is now part of the signed string, an attacker who
+captures a valid delivery cannot reuse it after the tolerance window has passed —
+the timestamp in the captured request will be too old and the signature will no
+longer match a freshly-computed one using the current time.
+
+Reject deliveries whose `X-Webhook-Timestamp` differs from the current time by
+more than five minutes:
 
 ```js
-function isRecentTimestamp(isoTimestamp, toleranceMs = 5 * 60 * 1000) {
-  const age = Date.now() - new Date(isoTimestamp).getTime();
-  return Math.abs(age) <= toleranceMs;
-}
-
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   const sig = req.headers['x-webhook-signature'];
-  const payload = JSON.parse(req.body.toString());
+  const ts = req.headers['x-webhook-timestamp'];
 
-  if (!isRecentTimestamp(payload.timestamp)) {
-    return res.status(401).json({ error: 'Timestamp too old — possible replay attack' });
+  if (!ts || Math.abs(Date.now() / 1000 - Number(ts)) > 300) {
+    return res.status(401).json({ error: 'Timestamp missing or too old — possible replay attack' });
   }
-  if (!verifySignature(process.env.WEBHOOK_SECRET, req.body, sig)) {
+  if (!verifySignature(process.env.WEBHOOK_SECRET, ts, req.body, sig)) {
     return res.status(401).json({ error: 'Invalid signature' });
   }
 
+  const payload = JSON.parse(req.body.toString());
   console.log('Verified webhook event:', payload.event);
   res.sendStatus(200);
 });

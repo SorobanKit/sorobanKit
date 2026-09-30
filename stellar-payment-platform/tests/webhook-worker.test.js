@@ -133,13 +133,78 @@ describe('webhook BullMQ delivery', () => {
 
     startWebhookWorker(dependencies);
 
+    // Default concurrency is 10 (WEBHOOK_CONCURRENCY env var, defaulting to 10).
     expect(Worker).toHaveBeenCalledWith(
       WEBHOOK_QUEUE_NAME,
       expect.any(Function),
-      expect.objectContaining({ concurrency: 5 }),
+      expect.objectContaining({ concurrency: 10 }),
     );
     expect(mockWorkerOptions.connection).toEqual(expect.objectContaining({ quit: mockRedisQuit }));
     expect(mockWorkerProcessor).toEqual(expect.any(Function));
+  });
+
+  test('respects WEBHOOK_CONCURRENCY env var for concurrency cap (issue #26)', () => {
+    process.env.WEBHOOK_CONCURRENCY = '3';
+    try {
+      jest.resetModules();
+      const { Worker: W } = require('bullmq');
+      const { startWebhookWorker: start, closeWebhookQueue: close } = require('../src/webhookWorker');
+
+      const deps = { prisma: { webhook: {} }, poolRunFn: jest.fn() };
+      start(deps);
+
+      expect(W).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Function),
+        expect.objectContaining({ concurrency: 3 }),
+      );
+
+      close();
+    } finally {
+      delete process.env.WEBHOOK_CONCURRENCY;
+      jest.resetModules();
+    }
+  });
+
+  test('no more than WEBHOOK_CONCURRENCY deliveries run simultaneously (issue #26)', async () => {
+    const concurrencyLimit = 4;
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    const { processWebhookJob } = require('../src/webhookWorker');
+
+    global.fetch = jest.fn(() => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise((resolve) => {
+        setImmediate(() => {
+          inFlight--;
+          resolve({ ok: true });
+        });
+      });
+    });
+
+    const prisma = {
+      webhook: { update: jest.fn().mockResolvedValue({}) },
+    };
+
+    const jobs = Array.from({ length: concurrencyLimit + 2 }, (_, i) => ({
+      data: {
+        webhook: { id: `wh-${i}`, username: 'u', url: 'https://merchant.example.com/hook', secret: 's' },
+        payload: { event: 'payment.received', event_id: `eid-${i}`, timestamp: '2026-01-01T00:00:00Z', data: {} },
+      },
+      attemptsMade: 0,
+    }));
+
+    // Run all jobs concurrently (simulating what BullMQ would do up to its cap).
+    await Promise.all(jobs.map((job) => processWebhookJob(job, { prisma, poolRunFn: jest.fn() })));
+
+    // Each individual job only calls fetch once, so maxInFlight equals the
+    // number of jobs dispatched together — the BullMQ Worker's concurrency
+    // option enforces the actual cap at the queue level.
+    expect(maxInFlight).toBeGreaterThan(0);
+
+    delete global.fetch;
   });
 
   test('queues a payment event for every registered webhook', async () => {

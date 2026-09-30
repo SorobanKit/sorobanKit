@@ -8,7 +8,7 @@ const WEBHOOK_TIMEOUT_MS = 10_000;
 const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
 const MAX_WEBHOOK_ATTEMPTS = 5;
 const WEBHOOK_BACKOFF_DELAY_MS = 1_000;
-const WEBHOOK_WORKER_CONCURRENCY = 5;
+const WEBHOOK_WORKER_CONCURRENCY = Number(process.env.WEBHOOK_CONCURRENCY) || 10;
 const MAX_RETRY_BACKLOG_DAYS = 3;
 
 const WEBHOOK_JOB_OPTIONS = Object.freeze({
@@ -26,8 +26,8 @@ let webhookWorker;
 let queueConnection;
 let workerConnection;
 
-const computeSignature = (secret, rawBody) => {
-  return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+const computeSignature = (secret, timestamp, rawBody) => {
+  return crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
 };
 
 const webhookEventMatches = (webhook, eventName) => {
@@ -197,7 +197,8 @@ const sendWebhook = async (url, payload, secret) => {
   // ── end SSRF guard ─────────────────────────────────────────────────────────
 
   const rawBody = JSON.stringify(payload);
-  const signature = computeSignature(secret, rawBody);
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const signature = computeSignature(secret, timestamp, rawBody);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
@@ -210,7 +211,7 @@ const sendWebhook = async (url, payload, secret) => {
         'X-Webhook-Signature': signature,
         // Legacy alias kept for backward compatibility.
         'X-Stellar-Tags-Signature': signature,
-        'X-Webhook-Timestamp': payload.timestamp,
+        'X-Webhook-Timestamp': timestamp,
       },
       body: rawBody,
       signal: controller.signal,
