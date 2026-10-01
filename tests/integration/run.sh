@@ -9,6 +9,9 @@
 #   2. `initialize` sets the admin and fee configuration.
 #   3. `route_payment` routes a payment end-to-end, deducting the platform
 #      fee and crediting the recipient, as observed through local Horizon.
+#   4. The full refund lifecycle: a payment to a recipient without a
+#      trustline credits the refund ledger, and `claim_all_refunds`
+#      returns the tokens to the sender.
 #
 # Prerequisites:
 #   - docker compose --profile integration up -d stellar-standalone
@@ -82,13 +85,18 @@ SENDER_ADDR="$(soroban keys address sender 2>/dev/null || soroban keys generate 
 RECIPIENT_ADDR="$(soroban keys address recipient 2>/dev/null || soroban keys generate --no-fund --rpc-url "${RPC_URL}" --network-passphrase "${NETWORK_PASSPHRASE}" recipient)"
 TREASURY_ADDR="$(soroban keys address treasury 2>/dev/null || soroban keys generate --no-fund --rpc-url "${RPC_URL}" --network-passphrase "${NETWORK_PASSPHRASE}" treasury)"
 
-echo "  admin:     ${ADMIN_ADDR}"
-echo "  sender:    ${SENDER_ADDR}"
-echo "  recipient: ${RECIPIENT_ADDR}"
-echo "  treasury:  ${TREASURY_ADDR}"
+# A recipient that intentionally has no trustline for the routed token, so
+# the payment cannot be delivered and must be recorded as a refund.
+NO_TRUSTLINE_ADDR="$(soroban keys address no_trustline 2>/dev/null || soroban keys generate --no-fund --rpc-url "${RPC_URL}" --network-passphrase "${NETWORK_PASSPHRASE}" no_trustline)"
+
+echo "  admin:        ${ADMIN_ADDR}"
+echo "  sender:       ${SENDER_ADDR}"
+echo "  recipient:    ${RECIPIENT_ADDR}"
+echo "  treasury:     ${TREASURY_ADDR}"
+echo "  no-trustline: ${NO_TRUSTLINE_ADDR}"
 
 echo "==> Funding accounts from root ..."
-for addr in "${ADMIN_ADDR}" "${SENDER_ADDR}" "${RECIPIENT_ADDR}" "${TREASURY_ADDR}"; do
+for addr in "${ADMIN_ADDR}" "${SENDER_ADDR}" "${RECIPIENT_ADDR}" "${TREASURY_ADDR}" "${NO_TRUSTLINE_ADDR}"; do
   soroban account fund \
     --account "${FUNDED_SECRET}" \
     --destination "${addr}" \
@@ -146,6 +154,58 @@ ROUTED_OPS="$(
     | grep -c '"type"' || true
 )"
 check "Horizon reports operations for contract (got: ${ROUTED_OPS})" $([ "${ROUTED_OPS}" -gt 0 ] && echo 0 || echo 1)
+
+echo "==> Routing a payment to a recipient without a trustline ..."
+# The recipient has no trustline for the routed token, so the payment cannot
+# be delivered and the contract must record it in the refund ledger.
+soroban contract invoke \
+  --id "${CONTRACT_ID}" \
+  --source "${SENDER_ADDR}" \
+  --rpc-url "${RPC_URL}" \
+  --network-passphrase "${NETWORK_PASSPHRASE}" \
+  -- \
+  route_payment \
+  --sender "${SENDER_ADDR}" \
+  --recipient "${NO_TRUSTLINE_ADDR}" \
+  --token_address "${CONTRACT_ID}" \
+  --amount 1000 >/dev/null 2>&1
+check "route_payment to no-trustline recipient executed" $?
+
+echo "==> Verifying refund ledger was credited ..."
+REFUND_AMOUNT="$(soroban contract invoke \
+  --id "${CONTRACT_ID}" \
+  --source "${SENDER_ADDR}" \
+  --rpc-url "${RPC_URL}" \
+  --network-passphrase "${NETWORK_PASSPHRASE}" \
+  -- \
+  get_refund \
+  --sender "${SENDER_ADDR}" 2>/dev/null || echo "0")"
+echo "  refund ledger credit for sender: ${REFUND_AMOUNT}"
+check "refund ledger credited for sender (got: ${REFUND_AMOUNT})" $([ "${REFUND_AMOUNT}" -gt 0 ] && echo 0 || echo 1)
+
+echo "==> Claiming all refunds ..."
+CLAIMED="$(soroban contract invoke \
+  --id "${CONTRACT_ID}" \
+  --source "${SENDER_ADDR}" \
+  --rpc-url "${RPC_URL}" \
+  --network-passphrase "${NETWORK_PASSPHRASE}" \
+  -- \
+  claim_all_refunds \
+  --sender "${SENDER_ADDR}" 2>/dev/null || echo "0")"
+echo "  claim_all_refunds returned: ${CLAIMED}"
+check "claim_all_refunds returned the refunded amount (got: ${CLAIMED})" $([ "${CLAIMED}" -gt 0 ] && echo 0 || echo 1)
+
+echo "==> Verifying refund ledger is drained after claim ..."
+REMAINING="$(soroban contract invoke \
+  --id "${CONTRACT_ID}" \
+  --source "${SENDER_ADDR}" \
+  --rpc-url "${RPC_URL}" \
+  --network-passphrase "${NETWORK_PASSPHRASE}" \
+  -- \
+  get_refund \
+  --sender "${SENDER_ADDR}" 2>/dev/null || echo "0")"
+echo "  remaining refund ledger for sender: ${REMAINING}"
+check "refund ledger drained after claim (got: ${REMAINING})" $([ "${REMAINING}" = "0" ] && echo 0 || echo 1)
 
 echo ""
 echo "=============================================="

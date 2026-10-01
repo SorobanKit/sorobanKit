@@ -11,10 +11,39 @@ database connection pool and system resources.
 
 ## Importing the Dashboard
 
+The dashboard uses a datasource template variable (`${DS_PROMETHEUS}`) instead
+of a hardcoded datasource UID, so it can be imported into any Grafana instance
+without editing the JSON. The `__inputs` section declares a `DS_PROMETHEUS`
+input of type `datasource` with `pluginId` `prometheus`; Grafana prompts for it
+during import.
+
 1. Open Grafana and navigate to **Dashboards > Import**.
 2. Click **Upload JSON file** and select `docs/grafana-dashboard.json`.
-3. Select your Prometheus datasource when prompted.
+3. When prompted for the **Prometheus** datasource input (`DS_PROMETHEUS`),
+   select your Prometheus datasource from the dropdown.
 4. Click **Import**.
+
+No manual edits to the JSON are required: every panel references the
+`${DS_PROMETHEUS}` variable, which resolves to the datasource you selected.
+
+If you prefer to import via the API, pass the datasource in the request body:
+
+```sh
+curl -X POST http://localhost:3000/api/dashboards/import \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "dashboard": <contents of docs/grafana-dashboard.json>,
+    "overwrite": true,
+    "inputs": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "pluginId": "prometheus",
+        "value": "<your-prometheus-datasource-uid>"
+      }
+    ]
+  }'
+```
 
 The dashboard uid is `stellar-tags-db-pool` and can be accessed directly at
 `/d/stellar-tags-db-pool`.
@@ -48,6 +77,7 @@ The dashboard uid is `stellar-tags-db-pool` and can be accessed directly at
 
 | Variable | Description |
 | --- | --- |
+| `DS_PROMETHEUS` | Prometheus datasource input, declared in the dashboard's `__inputs` section and selected during import. |
 | `datasource` | Prometheus datasource selector. |
 | `instance` | Filters by scrape target instance (multi-select, defaults to All). |
 
