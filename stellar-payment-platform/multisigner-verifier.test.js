@@ -330,6 +330,77 @@ describe('Multi-Signer Verification Module', () => {
     });
   });
 
+  describe('verifyMultiSignerThreshold sequence number check', () => {
+    const accountId = 'GDZST3XVCDTUJ76ZAV2HA72KYQM3DGLLFVDNNZ6XTQCR3BQFGMQ25E4Z';
+    const mockAccount = {
+      id: accountId,
+      signers: [{ key: accountId, weight: 1, signer_type: 'ed25519_public_key' }],
+      thresholds: { low_threshold: 1, med_threshold: 2, high_threshold: 3 },
+      sequence: '123456789',
+      balances: [],
+    };
+
+    beforeEach(() => {
+      loadAccount.mockResolvedValue(mockAccount);
+    });
+
+    it('succeeds when the transaction sequence is account sequence + 1', async () => {
+      const result = await verifyMultiSignerThreshold(accountId, [accountId], {
+        transactionSequence: '123456790',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.errorMessage).toBe(null);
+    });
+
+    it('fails for a stale (replayed) sequence number', async () => {
+      const result = await verifyMultiSignerThreshold(accountId, [accountId], {
+        transactionSequence: '123456789',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errorMessage).toMatch(/invalid sequence number/);
+    });
+
+    it('fails for a sequence number that is too far ahead', async () => {
+      const result = await verifyMultiSignerThreshold(accountId, [accountId], {
+        transactionSequence: '123456791',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errorMessage).toMatch(/invalid sequence number/);
+    });
+
+    it('handles 64-bit sequences without precision loss', async () => {
+      loadAccount.mockResolvedValue({ ...mockAccount, sequence: '9007199254740993' });
+
+      const ok = await verifyMultiSignerThreshold(accountId, [accountId], {
+        transactionSequence: '9007199254740994',
+      });
+      const stale = await verifyMultiSignerThreshold(accountId, [accountId], {
+        transactionSequence: '9007199254740993',
+      });
+
+      expect(ok.success).toBe(true);
+      expect(stale.success).toBe(false);
+    });
+
+    it('fails for a malformed sequence number', async () => {
+      const result = await verifyMultiSignerThreshold(accountId, [accountId], {
+        transactionSequence: 'abc',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errorMessage).toMatch(/invalid sequence number/);
+    });
+
+    it('skips the check when no transactionSequence is supplied', async () => {
+      const result = await verifyMultiSignerThreshold(accountId, [accountId]);
+
+      expect(result.success).toBe(true);
+    });
+  });
+
   describe('isSingleSignerAccount', () => {
     it('should return true for single-signer account with weight 1', () => {
       const signers = [

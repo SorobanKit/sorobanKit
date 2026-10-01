@@ -131,12 +131,38 @@ function getApplicableThreshold(operationType = 'payment', thresholds) {
 }
 
 /**
+ * Returns the sequence number the next transaction must carry (current + 1).
+ * Sequence numbers are 64-bit, so BigInt is used to avoid precision loss.
+ * @param {string|number|bigint} accountSequence - Current account sequence from Horizon
+ * @returns {string}
+ */
+function nextSequence(accountSequence) {
+  return (BigInt(accountSequence) + 1n).toString();
+}
+
+/**
+ * @param {string|number|bigint} transactionSequence
+ * @param {string|number|bigint} accountSequence
+ * @returns {boolean} True only when transactionSequence === accountSequence + 1
+ */
+function isExpectedSequence(transactionSequence, accountSequence) {
+  try {
+    return BigInt(transactionSequence) === BigInt(accountSequence) + 1n;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Verifies that provided signatures meet the account's signing requirements
  * @param {string} accountId - The Stellar account public key
  * @param {Array<string>} signaturePublicKeys - Array of public keys that signed
  * @param {Object} options - Verification options
  * @param {string} options.operationType - Type of operation ('payment', 'management', 'high')
  * @param {string} options.horizonUrl - Custom Horizon URL
+ * @param {string|number|bigint} [options.transactionSequence] - Sequence number of the signed
+ *   transaction. When provided it must equal the account's current Horizon sequence + 1,
+ *   otherwise verification fails (guards against replay of stale signed transactions).
  * @returns {Promise<Object>} Verification result with details
  * @throws {Error} If verification fails
  */
@@ -144,6 +170,7 @@ async function verifyMultiSignerThreshold(accountId, signaturePublicKeys = [], o
   const {
     operationType = 'payment',
     horizonUrl = HORIZON_BASE,
+    transactionSequence,
   } = options;
 
   // Validate inputs
@@ -173,8 +200,13 @@ async function verifyMultiSignerThreshold(accountId, signaturePublicKeys = [], o
   // Check if weight meets threshold
   const meetsThreshold = totalWeight >= requiredThreshold;
 
+  // Reject stale / replayed transactions: the signed transaction's sequence
+  // must be exactly the account's current sequence + 1.
+  const hasSequence = transactionSequence !== undefined && transactionSequence !== null;
+  const sequenceValid = !hasSequence || isExpectedSequence(transactionSequence, accountDetails.sequence);
+
   return {
-    success: meetsThreshold,
+    success: meetsThreshold && sequenceValid,
     accountId,
     operationType,
     requiredThreshold,
@@ -184,8 +216,11 @@ async function verifyMultiSignerThreshold(accountId, signaturePublicKeys = [], o
     signatures: signatureDetails,
     thresholds: accountDetails.thresholds,
     signerCount: accountDetails.signers.length,
-    errorMessage: meetsThreshold ? null : 
-      `Insufficient signing weight. Required: ${requiredThreshold}, Provided: ${totalWeight}`,
+    errorMessage: !sequenceValid
+      ? `invalid sequence number. Expected: ${nextSequence(accountDetails.sequence)}, Provided: ${transactionSequence}`
+      : meetsThreshold
+        ? null
+        : `Insufficient signing weight. Required: ${requiredThreshold}, Provided: ${totalWeight}`,
   };
 }
 
