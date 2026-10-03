@@ -2,6 +2,11 @@
 
 const { WebhookEvent } = require('./models');
 const { deliverWebhook } = require('./webhookDelivery');
+const {
+  webhookDeliveriesTotal,
+  webhookDeliveryDurationSeconds,
+  webhookDlqSize,
+} = require('./metrics');
 
 const MAX_ATTEMPTS = 5;
 const BASE_BACKOFF_MS = 1000;
@@ -27,9 +32,12 @@ async function processWebhookEvent(event) {
     attempt += 1;
 
     let response;
+    const deliveryStart = process.hrtime.bigint();
     try {
       response = await deliverWebhook(event);
     } catch (err) {
+      const durationSeconds = Number(process.hrtime.bigint() - deliveryStart) / 1e9;
+      webhookDeliveryDurationSeconds.observe(durationSeconds);
       lastError = err && err.message ? err.message : String(err);
       await event.update({ attempt_count: attempt, last_error: lastError });
       if (attempt < MAX_ATTEMPTS) {
@@ -39,6 +47,9 @@ async function processWebhookEvent(event) {
       break;
     }
 
+    const durationSeconds = Number(process.hrtime.bigint() - deliveryStart) / 1e9;
+    webhookDeliveryDurationSeconds.observe(durationSeconds);
+
     if (response && response.status >= 200 && response.status < 300) {
       await event.update({
         status: 'delivered',
@@ -46,6 +57,7 @@ async function processWebhookEvent(event) {
         last_error: null,
         delivered_at: new Date(),
       });
+      webhookDeliveriesTotal.inc({ status: 'success' });
       return event;
     }
 
@@ -67,6 +79,7 @@ async function processWebhookEvent(event) {
     attempt_count: attempt,
     last_error: lastError,
   });
+  webhookDeliveriesTotal.inc({ status: 'failure' });
   await moveToDeadLetterQueue(event);
   return event;
 }
@@ -81,6 +94,8 @@ async function moveToDeadLetterQueue(event) {
     last_error: event.last_error,
     original_event_id: event.id,
   });
+  const dlqDepth = await WebhookEvent.count({ where: { status: 'dead_letter' } });
+  webhookDlqSize.set(dlqDepth);
 }
 
 module.exports = {
