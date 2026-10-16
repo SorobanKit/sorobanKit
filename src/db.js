@@ -1,3 +1,8 @@
+if (!process.env.DATABASE_URL) {
+  console.error('DATABASE_URL is not set — see README for database setup');
+  throw new Error('DATABASE_URL is not set — see README for database setup');
+}
+
 const { PrismaClient } = require('@prisma/client');
 
 // Reuse a single PrismaClient instance across the process.
