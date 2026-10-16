@@ -9,6 +9,7 @@
     "load:test": "artillery run artillery.yml",
     "generate:bindings": "bash scripts/generate-bindings.sh",
     "test:integration": "bash tests/integration/run.sh",
+    "changelog": "npx -y conventional-changelog-cli -p angular -i CHANGELOG.md -s",
     "contract:build": "node scripts/deploy.js build",
     "contract:deploy": "node scripts/deploy.js deploy",
     "contract:upgrade": "node scripts/deploy.js upgrade"
@@ -16,6 +17,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "artillery": "^2.0.33",
+    "conventional-changelog-cli": "^5.0.0",
     "eslint": "^10.5.0",
     "globals": "^17.6.0",
     "husky": "^9.1.7",
