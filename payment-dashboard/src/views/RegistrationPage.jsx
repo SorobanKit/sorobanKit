@@ -180,8 +180,11 @@ function RegistrationPage({
           "error"
         );
       } else {
-        // Handle all other normal errors
-        setStatusMessage(err.message || "Signature request cancelled.", "error");
+        // Explicit user-friendly message when signing fails or is rejected
+        setStatusMessage(
+          "Transaction signing was cancelled or failed — no transaction was submitted",
+          "error"
+        );
       }
       setIsSubmitting(false);
       return;
