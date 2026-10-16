@@ -652,6 +652,10 @@ Upon successful deployment, the tool automatically updates the contract address 
 - The dashboard calls the Node.js API at `http://localhost:5000` via `VITE_API_BASE` and a `/api` proxy.
 - The Soroban contract handles on-chain payment routing logic.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history, release notes, and notable changes following the Keep a Changelog standard.
+
 ## License
 
 See [LICENSE](LICENSE).
