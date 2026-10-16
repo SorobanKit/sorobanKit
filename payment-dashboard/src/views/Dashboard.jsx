@@ -324,8 +324,14 @@ function Dashboard({
         signedXdrResponse = await freighterApi.signTransaction(
           assembledTransaction.toXDR(),
         );
+        if (!signedXdrResponse || signedXdrResponse.error) {
+          throw new Error(signedXdrResponse?.error || "Transaction signing was rejected");
+        }
       } catch (err) {
-        throw new Error(`Wallet signing failed: ${err.message}`, { cause: err });
+        throw new Error(
+          "Transaction signing was cancelled or failed — no transaction was submitted",
+          { cause: err }
+        );
       }
 
       toast.success("Payment submitted.", { id: toastId });
