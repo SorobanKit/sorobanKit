@@ -86,3 +86,8 @@ cargo test --manifest-path contracts/Cargo.toml
 - Ensure all relevant test suites pass before opening a PR.
 - Reference the issue being addressed in the PR description (`Closes #<issue>`).
 - Keep PRs small and reviewable; avoid unrelated refactors.
+
+## Security
+
+If you discover a potential security vulnerability, please do NOT create a public issue or discussion. Follow our responsible disclosure process documented in [SECURITY.md](SECURITY.md).
+
