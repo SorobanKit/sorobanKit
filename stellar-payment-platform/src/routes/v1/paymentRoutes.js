@@ -42,7 +42,8 @@ module.exports = (redisClient) => {
       err.statusCode = 400;
       throw err;
     }
-    if (!StrKey.isValidEd25519PublicKey(intent.to)) {
+    const dest = intent.destinationAddress || intent.to;
+    if (!StrKey.isValidEd25519PublicKey(dest)) {
       const err = new Error(`Invalid Stellar public key for 'to' at index ${idx}`);
       err.statusCode = 400;
       throw err;
@@ -54,7 +55,7 @@ module.exports = (redisClient) => {
       data: {
         externalId: intent.external_id,
         from: intent.from,
-        to: intent.to,
+        to: intent.to || intent.destinationAddress,
         amount: intent.amount,
         asset: intent.asset,
         memoType: intent.memo_type,
