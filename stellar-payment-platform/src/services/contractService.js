@@ -1,8 +1,30 @@
-const { rpc, Contract, xdr, scValToNative, TransactionBuilder, Account, Keypair, Networks } = require('@stellar/stellar-sdk');
+const { rpc, Contract, xdr, scValToNative, TransactionBuilder, Account, Keypair, Networks, StrKey } = require('@stellar/stellar-sdk');
 
 const RPC_URL = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
 const CONTRACT_ID = process.env.CONTRACT_ID;
 
+/**
+ * Validates that CONTRACT_ID is provided and conforms to the Soroban contract address
+ * format (valid Soroban contract address starting with 'C').
+ *
+ * @param {string} [id] - The contract ID to validate (defaults to process.env.CONTRACT_ID).
+ * @throws {Error} If CONTRACT_ID is missing or not a valid contract address starting with 'C'.
+ */
+function validateContractId(id = process.env.CONTRACT_ID) {
+  if (!id) {
+    throw new Error('CONTRACT_ID environment variable is not set');
+  }
+  if (!StrKey || typeof StrKey.isValidContract !== 'function' || !StrKey.isValidContract(id)) {
+    throw new Error('Invalid CONTRACT_ID format: must be a valid Soroban contract address starting with C');
+  }
+}
+
+// Pre-flight check at module initialisation time per #289
+if (process.env.NODE_ENV !== 'test') {
+  validateContractId(process.env.CONTRACT_ID);
+} else if (process.env.CONTRACT_ID) {
+  validateContractId(process.env.CONTRACT_ID);
+}
 
 let cache = {
   data: null,
@@ -12,9 +34,8 @@ let cache = {
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 async function getContractStatus() {
-  if (!CONTRACT_ID) {
-    throw new Error('CONTRACT_ID environment variable is not set');
-  }
+  const activeContractId = process.env.CONTRACT_ID || CONTRACT_ID;
+  validateContractId(activeContractId);
 
   const now = Date.now();
   if (cache.data && (now - cache.timestamp < CACHE_TTL)) {
@@ -25,7 +46,7 @@ async function getContractStatus() {
   // Assume testnet by default if not specified with a safe fallback to prevent tests from crashing
   const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || (Networks && Networks.TESTNET) || 'Test SDF Network ; September 2015';
   const server = new rpc.Server(RPC_URL);
-  const contract = new Contract(CONTRACT_ID);
+  const contract = new Contract(activeContractId);
   
   // 1. Fetch Instance Storage
   const ledgerKey = xdr.LedgerKey.contractData(
@@ -47,7 +68,7 @@ async function getContractStatus() {
   const storageMap = instance.storage();
 
   const status = {
-    contract_id: CONTRACT_ID,
+    contract_id: activeContractId,
     version: null,
     paused_state: false,
     fee_bps: null,
@@ -109,5 +130,6 @@ async function getContractStatus() {
 }
 
 module.exports = {
-  getContractStatus
+  getContractStatus,
+  validateContractId,
 };
