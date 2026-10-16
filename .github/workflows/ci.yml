@@ -90,3 +90,46 @@ jobs:
         
       - name: Verify Vite Build (Catches Vercel Crashes)
         run: npm run build
+
+  workspace-test-all:
+    name: All Workspace Tests (npm run test:all)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.9-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stellar_tags_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Workspace Dependencies
+        run: |
+          npm install --prefix payment-dashboard --legacy-peer-deps
+          npm install --prefix stellar-payment-platform
+
+      - name: Run test:all
+        run: npm run test:all
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
