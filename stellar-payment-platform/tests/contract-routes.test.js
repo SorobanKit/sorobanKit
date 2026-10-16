@@ -39,6 +39,13 @@ describe('GET /contract/status', () => {
     expect(res.body).toEqual({ error: 'Contract configuration is missing' });
   });
 
+  it('returns 500 with an invalid contract message when CONTRACT_ID format is invalid', async () => {
+    mockGetContractStatus.mockRejectedValue(new Error('Invalid CONTRACT_ID format: must be a valid Soroban contract address starting with C'));
+    const res = await request(buildApp()).get('/contract/status');
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Contract configuration is invalid' });
+  });
+
   it('returns 500 with a generic message for other failures', async () => {
     mockGetContractStatus.mockRejectedValue(new Error('upstream exploded'));
     const res = await request(buildApp()).get('/contract/status');
