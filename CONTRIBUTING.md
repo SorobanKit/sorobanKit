@@ -61,22 +61,41 @@ cargo install --locked stellar-cli --features opt
 
 ## Running Tests
 
-### Frontend
+To run all test suites across the entire repository (frontend, backend, and smart contracts) in sequence from the root directory:
 
 ```bash
-npm test
+npm run test:all
 ```
 
-### Backend
+The command executes:
+1. **Frontend:** `npm test --workspace=payment-dashboard` (Vitest)
+2. **Backend:** `npm test --workspace=stellar-payment-platform` (Jest)
+3. **Smart Contracts:** `cd payment_router && cargo test` (Cargo / Soroban)
+
+If any workspace test suite fails, execution halts immediately and the command exits with a non-zero code.
+
+### Running Workspace Tests Individually
+
+You can also run tests for individual workspaces directly from the repository root:
+
+#### Frontend (`payment-dashboard`)
 
 ```bash
-cargo test --manifest-path backend/Cargo.toml
+npm test --workspace=payment-dashboard
+# or: cd payment-dashboard && npm test
 ```
 
-### Contracts
+#### Backend (`stellar-payment-platform`)
 
 ```bash
-cargo test --manifest-path contracts/Cargo.toml
+npm test --workspace=stellar-payment-platform
+# or: cd stellar-payment-platform && npm test
+```
+
+#### Contracts (`payment_router`)
+
+```bash
+cd payment_router && cargo test
 ```
 
 ## Pull Request Conventions
