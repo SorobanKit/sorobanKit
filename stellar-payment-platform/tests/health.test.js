@@ -99,10 +99,28 @@ describe('GET /health', () => {
 
     expect(res.status).toBe(503);
     expect(res.body).toMatchObject({
+      status: 'DOWN',
       database: 'down',
       redis: 'down',
       horizon: 'down',
     });
+  });
+
+  test('returns 503 with status DOWN and message naming all three failures when all dependencies fail simultaneously', async () => {
+    prisma.$queryRaw.mockRejectedValue(new Error('connection refused'));
+    redisClient.ping.mockRejectedValue(new Error('not connected'));
+    global.fetch.mockRejectedValue(new Error('ETIMEDOUT'));
+
+    const res = await request(buildApp(redisClient)).get('/health');
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('DOWN');
+    expect(res.body.database).toBe('down');
+    expect(res.body.redis).toBe('down');
+    expect(res.body.horizon).toBe('down');
+    expect(res.body.message).toContain('Database unavailable');
+    expect(res.body.message).toContain('Redis unavailable');
+    expect(res.body.message).toContain('Horizon unavailable');
   });
 
   test('reports Redis as not configured and stays healthy without it', async () => {
