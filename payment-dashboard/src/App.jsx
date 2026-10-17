@@ -3,6 +3,7 @@ import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { toast, Toaster } from "react-hot-toast";
 import logger from "./logger";
 import LoadingSpinner from './components/LoadingSpinner';
+import KeyboardShortcutsModal from './components/KeyboardShortcutsModal';
 import { HORIZON_BASE, API_BASE, walletKit } from './views/shared';
 
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
@@ -223,64 +224,80 @@ const [activeView, setActiveView] = useState('dashboard')
     [activeView, handleNavigate],
   );
 
-  if (activeView === "register" && (registrationState === "new" || registrationState === "skipped")) {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading registration..." />}>
+  const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
 
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      const target = event.target;
+      const isInput =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+
+      // '?' key opens/toggles the keyboard shortcuts modal
+      if (
+        (event.key === "?" || (event.shiftKey && event.key === "/")) &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey
+      ) {
+        if (!isInput) {
+          event.preventDefault();
+          setIsShortcutsOpen((prev) => !prev);
+          return;
+        }
+      }
+
+      // Escape key closes the shortcuts modal
+      if (event.key === "Escape" && isShortcutsOpen) {
+        event.preventDefault();
+        setIsShortcutsOpen(false);
+        return;
+      }
+
+      // Alt key navigation shortcuts (Alt+R, Alt+H, Alt+A)
+      if (event.altKey && !event.ctrlKey && !event.metaKey) {
+        if (isInput) {
+          return;
+        }
+
+        const key = event.key.toLowerCase();
+        if (key === "r") {
+          event.preventDefault();
+          handleNavigate("register");
+        } else if (key === "h") {
+          event.preventDefault();
+          handleNavigate("history");
+        } else if (key === "a") {
+          event.preventDefault();
+          handleNavigate("analytics");
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleNavigate, isShortcutsOpen]);
+
+  const renderCurrentView = () => {
+    if (activeView === "register") {
+      return (
         <RegistrationPage
           userPublicKey={userPublicKey}
           setUserPublicKey={setUserPublicKey}
           onBack={() => {
-            setRegistrationState("skipped"); // This breaks the loop!
+            setRegistrationState("skipped");
             handleNavigate("dashboard");
           }}
           onRegistered={() => handleRegistrationStateChange("existing")}
         />
-        </Suspense>
-      </>
-    );
-  }
+      );
+    }
 
-  if (activeView === "help") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading help center..." />}>
-
+    if (activeView === "help") {
+      return (
         <HelpPage
           userPublicKey={userPublicKey}
           onConnectWallet={handleConnectWallet}
@@ -291,10 +308,61 @@ const [activeView, setActiveView] = useState('dashboard')
           onRegisterClick={() => handleNavigate("register")}
           canRegister={registrationState !== "existing"}
         />
-        </Suspense>
-      </>
+      );
+    }
+
+    if (activeView === "analytics") {
+      return (
+        <AnalyticsPage
+          userPublicKey={userPublicKey}
+          onConnectWallet={handleConnectWallet}
+          onDisconnectWallet={handleDisconnectWallet}
+          onDashboardClick={() => handleNavigate("dashboard")}
+          onHistoryClick={() => handleNavigate("history")}
+          onHelpClick={() => handleNavigate("help")}
+          onRegisterClick={() => handleNavigate("register")}
+          canRegister={registrationState !== "existing"}
+        />
+      );
+    }
+
+    if (activeView === "history") {
+      return (
+        <HistoryPage
+          userPublicKey={userPublicKey}
+          setUserPublicKey={setUserPublicKey}
+          onConnectWallet={handleConnectWallet}
+          onDisconnectWallet={handleDisconnectWallet}
+          onRefreshBalance={loadBalance}
+          onDashboardClick={() => handleNavigate("dashboard")}
+          onAnalyticsClick={() => handleNavigate("analytics")}
+          onHelpClick={() => handleNavigate("help")}
+          onRegisterClick={() => handleNavigate("register")}
+          canRegister={registrationState !== "existing"}
+        />
+      );
+    }
+
+    return (
+      <Dashboard
+        userPublicKey={userPublicKey}
+        balance={balance}
+        isRefreshing={isRefreshing}
+        balanceError={balanceError}
+        onRefreshBalance={loadBalance}
+        onConnectWallet={handleConnectWallet}
+        onDisconnectWallet={handleDisconnectWallet}
+        onNavigate={handleNavigate}
+        onRegisterClick={() => handleNavigate("register")}
+        onAnalyticsClick={() => handleNavigate("analytics")}
+        onHistoryClick={() => handleNavigate("history")}
+        onHelpClick={() => handleNavigate("help")}
+        canRegister={registrationState !== "existing"}
+        registrationState={registrationState}
+        onRegistrationStateChange={handleRegistrationStateChange}
+      />
     );
-  }
+  };
 
   return (
     <>
@@ -315,20 +383,13 @@ const [activeView, setActiveView] = useState('dashboard')
           ⚠️ You are currently offline. Transactions will fail.
         </div>
       )}
-      <Suspense fallback={<ViewFallback label="Loading dashboard..." />}>
-        <Dashboard
-          userPublicKey={userPublicKey}
-          balance={balance}
-          isRefreshing={isRefreshing}
-          balanceError={balanceError}
-          onRefreshBalance={loadBalance}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onNavigate={handleNavigate}
-          registrationState={registrationState}
-          onRegistrationStateChange={handleRegistrationStateChange}
-        />
+      <Suspense fallback={<ViewFallback label={`Loading ${activeView}...`} />}>
+        {renderCurrentView()}
       </Suspense>
+      <KeyboardShortcutsModal
+        isOpen={isShortcutsOpen}
+        onClose={() => setIsShortcutsOpen(false)}
+      />
       <Toaster position="bottom-right" />
     </>
   );
