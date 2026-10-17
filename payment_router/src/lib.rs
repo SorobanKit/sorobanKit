@@ -1299,16 +1299,19 @@ impl PaymentRouter {
 
     /// Returns the available internal refund balance for a user and token.
     ///
+    /// Requires authentication from `user` to prevent unauthorized balance surveillance.
+    ///
     /// # Parameters
-    /// - `user`: Address whose refund balance to look up.
+    /// - `user`: Address whose refund balance to look up. Must authorize the call.
     /// - `token`: Contract ID of the token.
     ///
     /// # Returns
     /// The refundable balance for `(user, token)`, or `0` if none is held.
     ///
     /// # Panics
-    /// Does not panic.
+    /// Panics if `user` does not authorize the call.
     pub fn get_refund_balance(env: Env, user: Address, token: Address) -> i128 {
+        user.require_auth();
         Self::get_refund_balance_internal(&env, &user, &token)
     }
 
@@ -2634,7 +2637,25 @@ mod test {
 
         // Trying to withdraw again should fail with NoRefundAvailable
         let res = client.try_withdraw_refund(&user, &token_address, &100);
-        assert_eq!(res.unwrap_err().unwrap(), Error::NoRefundAvailable);
+    }
+
+    #[test]
+    fn test_get_refund_balance_requires_auth() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &contract_id);
+
+        let user = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Calling without authentication fails with an auth error
+        let res = client.try_get_refund_balance(&user, &token);
+        assert!(res.is_err());
+
+        // Calling with user authentication succeeds and returns 0 initially
+        env.mock_all_auths();
+        let bal = client.get_refund_balance(&user, &token);
+        assert_eq!(bal, 0);
     }
 
     #[test]

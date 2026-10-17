@@ -606,7 +606,7 @@ When a recipient cannot receive routed tokens (e.g. missing trustline, invalid c
 
 ### Claiming Refunds
 Users can query and withdraw their credited refunds at any time using the pull-based withdrawal pattern:
-- `get_refund_balance(user: Address, token: Address) -> i128`: Query available internal refund balance.
+- `get_refund_balance(user: Address, token: Address) -> i128`: Query available internal refund balance (requires `user` authentication to prevent unauthorized surveillance).
 - `withdraw_refund(user: Address, token: Address, amount: i128) -> Result<(), Error>`: Withdraw a specific amount of credited tokens.
 - `claim_all_refunds(user: Address, token: Address) -> Result<i128, Error>`: Claim and withdraw the entire available refund balance in a single transaction.
 
