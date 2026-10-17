@@ -62,6 +62,26 @@ function HelpPage({
         </p>
       </div>
     ),
+    shortcuts: (
+      <div className="help-action-content">
+        <p>
+          <strong>Keyboard Shortcuts:</strong> Navigate the dashboard efficiently using dedicated access keys without relying on a mouse.
+        </p>
+        <div className="help-action-block">
+          <strong>Available Shortcuts:</strong>
+          <ul>
+            <li><kbd>Alt</kbd> + <kbd>R</kbd> : Navigate to Registration (Primary CTA)</li>
+            <li><kbd>Alt</kbd> + <kbd>H</kbd> : Navigate to Transaction History</li>
+            <li><kbd>Alt</kbd> + <kbd>A</kbd> : Navigate to Analytics</li>
+            <li><kbd>?</kbd> : Open or toggle the Keyboard Shortcuts modal</li>
+            <li><kbd>Escape</kbd> : Close open modals and dialogs</li>
+          </ul>
+        </div>
+        <p className="help-action-note">
+          Note: Shortcuts are disabled while actively typing inside text inputs, search fields, or textareas.
+        </p>
+      </div>
+    ),
   };
   return (
     <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
@@ -163,6 +183,17 @@ function HelpPage({
                 }
               >
                 Troubleshooting
+              </button>
+              <button
+                type="button"
+                className={activeHelpAction === "shortcuts" ? "is-active" : ""}
+                onClick={() =>
+                  setActiveHelpAction((prev) =>
+                    prev === "shortcuts" ? "" : "shortcuts",
+                  )
+                }
+              >
+                Keyboard Shortcuts
               </button>
             </div>
             <div
