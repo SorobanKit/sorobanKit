@@ -301,5 +301,33 @@ describe('Admin Audit Logging System', () => {
         orderBy: { createdAt: 'desc' },
       });
     });
+
+    it('enforces limit upper bound and clamps ?limit=10000 to at most 100 rows', async () => {
+      mockAuditLogFindMany.mockResolvedValueOnce([]);
+
+      const res = await request(app)
+        .get('/api/v1/admin/audit-logs?limit=10000')
+        .set('x-api-key', 'test-admin-key');
+
+      expect(res.status).toBe(200);
+      expect(mockAuditLogFindMany).toHaveBeenCalledWith({
+        take: 100,
+        orderBy: { createdAt: 'desc' },
+      });
+    });
+
+    it('uses default limit of 50 when limit parameter is omitted', async () => {
+      mockAuditLogFindMany.mockResolvedValueOnce([]);
+
+      const res = await request(app)
+        .get('/api/v1/admin/audit-logs')
+        .set('x-api-key', 'test-admin-key');
+
+      expect(res.status).toBe(200);
+      expect(mockAuditLogFindMany).toHaveBeenCalledWith({
+        take: 50,
+        orderBy: { createdAt: 'desc' },
+      });
+    });
   });
 });
