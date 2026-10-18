@@ -558,7 +558,7 @@ Returns historical payment routing statistics and aggregated volumes, fees, and 
 ### `GET /admin/audit-logs`
 Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
 - **Query Parameters:**
-  - `limit` (optional) – Maximum number of records to return (1-100, default 50).
+  - `limit` (optional) – Maximum number of records to return (integer between 1 and 100, default 50; capped at 100).
 - **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
 - **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
 - **Status Codes:**

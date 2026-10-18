@@ -246,6 +246,17 @@ const adminExportQuerySchema = z
   );
 
 /**
+ * GET /admin/audit-logs query schema.
+ *
+ * - `limit` optional integer between 1 and 100, defaults to 50
+ */
+const adminAuditLogsQuerySchema = z
+  .object({
+    limit: clampedInt(50, 1, 100),
+  })
+  .loose();
+
+/**
  * GET /admin/stats/routing query.
  *
  * - `startDate` optional ISO date string (YYYY-MM-DD), inclusive lower bound
@@ -367,6 +378,7 @@ module.exports = {
   exportQuerySchema,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
+  adminAuditLogsQuerySchema,
   createApiKeyBodySchema,
   revokeApiKeyBodySchema,
   rotateApiKeyBodySchema,

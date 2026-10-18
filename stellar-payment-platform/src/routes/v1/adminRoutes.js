@@ -20,6 +20,7 @@ const {
   adminBlockBodySchema,
   adminExportQuerySchema,
   adminRoutingStatsQuerySchema,
+  adminAuditLogsQuerySchema,
 } = require('../../schemas');
 const { streamAdminExport } = require('../../utils/exporter');
 const { getRoutingStats } = require('../../services/statsService');
@@ -462,9 +463,10 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
 router.get(
     '/admin/audit-logs',
     adminAuth,
+    validateSchema({ query: adminAuditLogsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { prisma } = getPrisma();
-      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+      const limit = req.query.limit !== undefined ? req.query.limit : 50;
       const logs = await prisma.auditLog.findMany({
         take: limit,
         orderBy: { createdAt: 'desc' },
