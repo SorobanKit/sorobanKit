@@ -283,6 +283,7 @@ To ensure a seamless local developer installation requiring zero guesswork, plea
 
 ### Server (`stellar-payment-platform/.env` or exported directly)
 - `DATABASE_URL` - **(Required)** PostgreSQL connection string used by Prisma (see [Database setup](#database-setup)).
+- `REDIS_URL` - (Optional) Redis connection URL (e.g. `redis://localhost:6379`) used for the idempotency cache, rate limiter, federation cache, and BullMQ webhook worker. Can be omitted during local testing with mock stores; to start Redis locally run `docker compose --profile dev up redis`.
 - `PORT` - (Optional) The port for the Node.js server to listen on. Defaults to `5000`.
 - `HORIZON_NETWORK` - (Optional) Stellar network for the payment listener: `testnet` (default) or `public`.
 - `STELLAR_TAG_DOMAIN` - (Optional) Extra origin to add to the CORS allow-list.
