@@ -10,3 +10,8 @@ for (const key of REQUIRED_ENV_VARS) {
     }
   }
 }
+
+if (!process.env.REDIS_URL && process.env.NODE_ENV !== 'test') {
+  console.warn('[env] Warning: REDIS_URL is not set. Features relying on Redis (rate limiting, idempotency cache, federation cache, webhook worker) will fall back to local defaults or fail.');
+}
+
