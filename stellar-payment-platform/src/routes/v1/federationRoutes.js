@@ -27,7 +27,11 @@ module.exports = (redisClient) => {
  *       200:
  *         description: Success
  */
-router.get('/federation', etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
+router.get(
+  '/federation',
+  etagCache,
+  validateSchema({ query: federationQuerySchema }),
+  asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
 
     try {
@@ -107,7 +111,8 @@ router.get('/federation', etagCache, validateSchema({ query: federationQuerySche
       dbError.statusCode = 500;
       return next(dbError);
     }
-  }));
+  }),
+  );
 
   return router;
 };

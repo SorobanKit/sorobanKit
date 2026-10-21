@@ -97,17 +97,34 @@ describe('request schemas', () => {
     });
 
     test.each(['id', 'name'])('accepts type=%s', (type) => {
-      expect(federationQuerySchema.safeParse({ q: 'alice', type }).success).toBe(true);
+      expect(federationQuerySchema.safeParse({ q: 'alice*localhost', type }).success).toBe(true);
     });
 
     test('rejects an unsupported type', () => {
-      expect(messagesFor(federationQuerySchema, { q: 'alice', type: 'bogus' })).toContain(
+      expect(messagesFor(federationQuerySchema, { q: 'alice*localhost', type: 'bogus' })).toContain(
         "type: Unsupported query type. Supported types: 'id', 'name'",
       );
     });
 
     test('treats an absent type as valid', () => {
-      expect(federationQuerySchema.safeParse({ q: 'alice' }).success).toBe(true);
+      expect(federationQuerySchema.safeParse({ q: 'alice*localhost' }).success).toBe(true);
+    });
+
+    test('accepts a well-formed federation address', () => {
+      expect(federationQuerySchema.safeParse({ q: 'alice*localhost' }).success).toBe(true);
+      expect(federationQuerySchema.safeParse({ q: 'alice*localhost', type: 'name' }).success).toBe(true);
+    });
+
+    test.each([
+      ['missing q', {}],
+      ['whitespace-only q', { q: '   ' }],
+      ['q without a separator', { q: 'nodomain' }],
+      ['q with two separators', { q: 'alice*localhost*extra' }],
+      ['q with an empty username part', { q: '*domain' }],
+      ['q with an empty domain part', { q: 'alice*' }],
+      ['q longer than 255 characters', { q: `${'a'.repeat(300)}*domain` }],
+    ])('rejects %s', (_label, input) => {
+      expect(federationQuerySchema.safeParse(input).success).toBe(false);
     });
   });
 
