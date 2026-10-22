@@ -36,8 +36,19 @@ function validateMemo(memoType, memo) {
   if (typeof memo !== 'string') {
     return 'memo must be a string.';
   }
-  if (memoType === 'text' && Buffer.byteLength(memo, 'utf8') > 28) {
-    return 'memo of type text must not exceed 28 bytes.';
+  if (memoType === 'text') {
+    // Check if memo contains the replacement character (U+FFFD), which indicates
+    // that invalid UTF-8 bytes were decoded by Node.js. We reject these because
+    // the original client data was not valid UTF-8 and would cause issues with
+    // the Stellar SDK downstream.
+    if (memo.includes('\uFFFD')) {
+      return 'memo of type text must contain valid UTF-8 characters.';
+    }
+    // Validate that when encoded as UTF-8, it doesn't exceed 28 bytes
+    const byteLength = Buffer.byteLength(memo, 'utf8');
+    if (byteLength > 28) {
+      return 'memo of type text must not exceed 28 bytes.';
+    }
   }
   if (memoType === 'id') {
     if (!MEMO_ID_RE.test(memo) || BigInt(memo) > 18446744073709551615n) {
