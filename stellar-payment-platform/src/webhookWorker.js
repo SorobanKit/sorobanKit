@@ -706,7 +706,6 @@ module.exports = {
   computeSignature,
   detectSsrfTarget,
   computeRetryDelay,
-  warnIfAliasOnly,
   WEBHOOK_TIMEOUT_MS,
   WEBHOOK_QUEUE_NAME,
   MAX_WEBHOOK_ATTEMPTS,

@@ -1,6 +1,6 @@
 'use strict';
 
-const { ApiError } = require('../errors/ApiError');
+const { ApiError } = require('../errors');
 
 /**
  * Valid state transitions for a payment intent.

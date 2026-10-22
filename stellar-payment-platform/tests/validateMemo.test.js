@@ -59,6 +59,49 @@ describe('validateMemo', () => {
       expect(validateMemo('text', 'abcd'.repeat(7))).toBeNull();
       expect(validateMemo('text', 'abcd'.repeat(8))).toBe('memo of type text must not exceed 28 bytes.');
     });
+
+    it('returns error for text memo with invalid UTF-8 bytes', () => {
+      // Create a string from a Buffer with invalid UTF-8 bytes
+      // When invalid UTF-8 is decoded, Node.js replaces it with U+FFFD
+      const invalidUtf8Buffer = Buffer.from([0xFF, 0xFE, 0xFD]);
+      const invalidUtf8String = invalidUtf8Buffer.toString('utf8');
+      // This string will contain replacement characters (U+FFFD)
+      expect(validateMemo('text', invalidUtf8String)).toBe('memo of type text must contain valid UTF-8 characters.');
+
+      // Another invalid sequence that decodes to replacement chars
+      const anotherInvalidBuffer = Buffer.from([0xC0, 0x80]);
+      const anotherInvalidString = anotherInvalidBuffer.toString('utf8');
+      expect(validateMemo('text', anotherInvalidString)).toBe('memo of type text must contain valid UTF-8 characters.');
+
+      // Incomplete multibyte sequence
+      const incompleteBuffer = Buffer.from([0xE0, 0x80]);
+      const incompleteString = incompleteBuffer.toString('utf8');
+      expect(validateMemo('text', incompleteString)).toBe('memo of type text must contain valid UTF-8 characters.');
+    });
+
+    it('accepts a text memo of exactly 28 bytes', () => {
+      // 28 single-byte ASCII characters
+      expect(validateMemo('text', 'a'.repeat(28))).toBeNull();
+      // 7 4-byte emoji characters = 28 bytes
+      const emoji28 = '😀'.repeat(7); // Each emoji is 4 bytes in UTF-8
+      expect(validateMemo('text', emoji28)).toBeNull();
+    });
+
+    it('rejects a text memo of 29 bytes', () => {
+      expect(validateMemo('text', 'a'.repeat(29))).toBe('memo of type text must not exceed 28 bytes.');
+      // 8 4-byte emoji characters = 32 bytes, exceeds limit
+      const emoji32 = '😀'.repeat(8);
+      expect(validateMemo('text', emoji32)).toBe('memo of type text must not exceed 28 bytes.');
+    });
+
+    it('allows valid UTF-8 multibyte characters within 28 bytes', () => {
+      // 'café' = 5 bytes (c=1, a=1, f=1, é=2)
+      expect(validateMemo('text', 'café')).toBeNull();
+      // Chinese characters: '你好' = 6 bytes (each is 3 bytes)
+      expect(validateMemo('text', '你好')).toBeNull();
+      // Mix of ASCII and multibyte
+      expect(validateMemo('text', 'hello你好')).toBeNull();
+    });
   });
 
   describe('memo_type: id', () => {
