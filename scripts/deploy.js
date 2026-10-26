@@ -534,7 +534,32 @@ const initializeContract = (options, contractId) => {
 };
 
 /**
- * Upgrades an existing contract to a new WASM hash.
+ * Reads the current admin address from a live contract.
+ * Returns null and logs a warning if the contract does not expose get_admin.
+ *
+ * @param {object} network
+ * @param {string} contractId
+ * @returns {string|null}
+ */
+const readContractAdmin = (network, contractId) => {
+  try {
+    const out = execSync(
+      `stellar contract invoke --id ${contractId} --network ${network.name} --rpc-url ${network.rpcUrl} -- get_admin`,
+      { cwd: CONTRACT_DIR, encoding: 'utf8' }
+    );
+    // The CLI wraps string values in quotes; strip them.
+    return out.trim().replace(/^"|"$/g, '') || null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Upgrades an existing contract to a new WASM hash, preserving the admin.
+ *
+ * The admin address is read from the live contract before the upgrade.  After
+ * the upgrade the same address is written back via set_admin so that a WASM
+ * migration that resets instance storage cannot silently remove the admin.
  *
  * @param {object} options
  * @param {string} contractId
@@ -542,15 +567,30 @@ const initializeContract = (options, contractId) => {
  */
 const upgradeContract = (options, contractId, wasmPath) => {
   const network = NETWORKS[options.network] || NETWORKS.testnet;
+  const sourceFlag = options.source ? `--source ${options.source}` : '';
 
   if (options.dryRun) {
+    logDryRun(
+      `stellar contract invoke --id ${contractId} --network ${network.name} -- get_admin`
+    );
     logDryRun(
       `stellar contract install --wasm ${wasmPath} --network ${network.name} --rpc-url ${network.rpcUrl}`
     );
     logDryRun(
-      `stellar contract invoke --id ${contractId} --network ${network.name} -- upgrade --new_wasm_hash <hash>`
+      `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- upgrade --new_wasm_hash <hash>`
+    );
+    logDryRun(
+      `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- set_admin --new_admin <admin>`
     );
     return;
+  }
+
+  // 1. Snapshot the admin before touching the contract.
+  const adminBefore = readContractAdmin(network, contractId) || options.admin;
+  if (adminBefore) {
+    console.log(`📋 Admin before upgrade: ${adminBefore}`);
+  } else {
+    console.warn('[deploy] Could not read admin before upgrade; admin may not be restored.');
   }
 
   const installOutput = execSync(
@@ -560,9 +600,26 @@ const upgradeContract = (options, contractId, wasmPath) => {
   const wasmHash = installOutput.trim();
 
   execSync(
-    `stellar contract invoke --id ${contractId} --network ${network.name} -- upgrade --new_wasm_hash ${wasmHash}`,
+    `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- upgrade --new_wasm_hash ${wasmHash}`,
     { cwd: CONTRACT_DIR, stdio: 'inherit' }
   );
+
+  // 2. Explicitly restore the admin so a migration that clears instance storage
+  //    cannot leave the contract without an owner.
+  if (adminBefore) {
+    try {
+      execSync(
+        `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- set_admin --new_admin ${adminBefore}`,
+        { cwd: CONTRACT_DIR, stdio: 'inherit' }
+      );
+      console.log(`✅ Admin restored after upgrade: ${adminBefore}`);
+    } catch (err) {
+      console.warn(
+        '[deploy] set_admin call after upgrade failed — admin may already be set:',
+        err.message,
+      );
+    }
+  }
 };
 
 /**
@@ -781,6 +838,7 @@ module.exports = {
   deployContract,
   initializeContract,
   upgradeContract,
+  readContractAdmin,
   getContractStatus,
   validateOptions,
   logDryRun,

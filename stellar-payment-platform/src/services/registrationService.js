@@ -1,7 +1,8 @@
 const { StrKey } = require('@stellar/stellar-sdk');
-const { prisma } = require('../../prismaClient');
+const { prisma, withTransaction } = require('../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../multisigner-verifier');
 const { logger } = require('../logger');
+const { recordActivity, ACTIVITY_ACTIONS } = require('./activityService');
 
 async function transferAccount(username, oldAddress, newAddress, oldSignature, newSignature) {
   if (!username) {
@@ -83,6 +84,58 @@ async function transferAccount(username, oldAddress, newAddress, oldSignature, n
   return updatedUser;
 }
 
+/**
+ * Soft-deletes a username (alias or primary) and emits an activity log entry.
+ *
+ * When the removed username is a non-primary alias the action is
+ * ALIAS_REMOVED so the activity trail distinguishes alias removals from
+ * full account deletions (USER_UNREGISTERED).  The address and the alias
+ * username are both written to metadata so reverse-federation lookups can be
+ * audited.
+ *
+ * @param {string} username  - Normalised username to remove.
+ * @param {object} [req]     - Express request object (for IP / user-agent).
+ * @returns {Promise<{username: string, address: string, isPrimary: boolean}>}
+ */
+async function removeAlias(username, req) {
+  const existing = await prisma.user.findFirst({
+    where: { username, deletedAt: null },
+  });
+
+  if (!existing) {
+    const err = new Error('Username not found or already deleted');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  await withTransaction(async (tx) => {
+    await tx.user.update({
+      where: { username },
+      data: { deletedAt: new Date() },
+    });
+  });
+
+  const action = existing.isPrimary
+    ? ACTIVITY_ACTIONS.USER_UNREGISTERED
+    : ACTIVITY_ACTIONS.ALIAS_REMOVED;
+
+  await recordActivity(prisma, {
+    username,
+    action,
+    metadata: {
+      username,
+      address: existing.address,
+      is_primary: existing.isPrimary,
+    },
+    req,
+  });
+
+  logger.info(`Removed ${existing.isPrimary ? 'primary account' : 'alias'} ${username} (address: ${existing.address})`);
+
+  return { username, address: existing.address, isPrimary: existing.isPrimary };
+}
+
 module.exports = {
   transferAccount,
+  removeAlias,
 };
