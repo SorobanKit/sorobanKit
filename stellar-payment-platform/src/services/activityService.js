@@ -14,6 +14,7 @@ const { logger } = require('../logger');
 const ACTIVITY_ACTIONS = {
   USER_REGISTERED: 'user.registered',
   USER_UNREGISTERED: 'user.unregistered',
+  ALIAS_REMOVED: 'alias.removed',
   USER_TRANSFERRED: 'user.transferred',
   USER_BLOCKED: 'user.blocked',
   WEBHOOK_CREATED: 'webhook.created',
