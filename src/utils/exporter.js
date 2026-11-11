@@ -8,15 +8,25 @@
  * Escape a single CSV field per RFC 4180.
  *
  * Wraps the value in double quotes and escapes any internal double-quote
- * characters by doubling them. This keeps fields containing commas,
- * newlines, or quotes from breaking the row structure.
+ * characters by doubling them when the value contains commas, double-quotes,
+ * or newlines. Keeps fields from breaking the row structure.
  *
  * @param {*} field - Value to escape. `null`/`undefined` become empty strings.
- * @returns {string} The quoted, escaped field.
+ * @returns {string} The escaped field.
  */
 function csvEscape(field) {
-  const value = field === null || field === undefined ? '' : String(field);
-  return '"' + value.replace(/"/g, '""') + '"';
+  if (field === null || field === undefined) {
+    return '';
+  }
+  const value =
+    typeof field === 'object' && !(field instanceof Date)
+      ? JSON.stringify(field)
+      : String(field);
+
+  if (/[",\r\n]/.test(value)) {
+    return '"' + value.replace(/"/g, '""') + '"';
+  }
+  return value;
 }
 
 /**
@@ -31,7 +41,9 @@ function memoToCsvRow(memo) {
     memo.content,
     memo.createdAt,
     memo.updatedAt,
-    memo.metadata,
+    typeof memo.metadata === 'object' && memo.metadata !== null
+      ? JSON.stringify(memo.metadata)
+      : memo.metadata,
   ];
   return fields.map(csvEscape).join(',');
 }
