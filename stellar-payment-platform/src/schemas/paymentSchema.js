@@ -1,9 +1,16 @@
 'use strict';
 
 const { z } = require('zod');
+const { StrKey } = require('@stellar/stellar-sdk');
 const { sanitized } = require('./index');
 
 const MAX_METADATA_BYTES = 2 * 1024;
+
+const destinationAddress = z
+  .string({ error: 'destinationAddress is required' })
+  .trim()
+  .min(1, 'destinationAddress cannot be empty')
+  .refine((addr) => StrKey.isValidEd25519PublicKey(addr), 'Invalid Stellar address');
 
 const metadataSchema = z
   .record(z.string(), z.json())
@@ -18,7 +25,8 @@ const paymentIntentSchema = z.object({
   // Stellar addresses and amounts are structurally constrained by the handler
   // (StrKey / numeric checks), so they don't need HTML sanitization here.
   from: z.string({ error: 'from address is required' }).trim().min(1),
-  to: z.string({ error: 'to address is required' }).trim().min(1),
+  to: z.string({ error: 'to address is required' }).trim().min(1).optional(),
+  destinationAddress: destinationAddress.optional(),
   amount: z.string({ error: 'amount is required' }).trim().min(1),
   asset: z.string().trim().optional(),
   // Memo fields are free text that may be stored and rendered in the dashboard.
@@ -33,5 +41,7 @@ module.exports = {
   paymentIntentSchema,
   bulkPaymentSchema,
   metadataSchema,
+  destinationAddress,
+  destinationAddressSchema: destinationAddress,
   MAX_METADATA_BYTES,
 };
