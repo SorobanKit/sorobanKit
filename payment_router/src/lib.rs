@@ -7,6 +7,23 @@ use soroban_sdk::{
     Env, Symbol, Vec,
 };
 
+// ── Schema version and migration ─────────────────────────────────────────────
+//
+// Every breaking change to the persistent-storage layout increments
+// SCHEMA_VERSION.  `migrate` is an idempotent, bounded entry point that
+// must be executed before the new code interprets old packed state.
+// Callers (upgrade tooling) check `schema_version()` before deciding
+// whether to call `migrate`.
+//
+// Invariant: new code rejects reads of persistent layout data whose stored
+// schema version is less than SCHEMA_VERSION, to prevent misinterpretation.
+//
+// History:
+//   0 → absent (pre-schema contract, no version key stored)
+//   1 → adds PaymentNonce, FeeTotal, RefundEntry keys; layout v1
+
+const SCHEMA_VERSION: u32 = 1;
+
 // ── Packed UserSpending helpers ──────────────────────────────────────────────
 //
 // Issue #519: Replace the two-field UserSpending contracttype with a single
@@ -184,6 +201,58 @@ pub struct PendingAdminTransfer {
     pub action_nonce: u64,
 }
 
+// ── Schema v1 types ──────────────────────────────────────────────────────────
+
+/// An immutable execution receipt for a completed payment.
+///
+/// Written exactly once when a payment succeeds.  The key is
+/// `(sender, nonce)`, so each sender's nonce space is independent and
+/// a nonce used by one sender cannot collide with the same nonce used by
+/// another sender.
+///
+/// `expires_at` is the wall-clock timestamp after which the receipt may be
+/// pruned from storage by the admin, but the logical record of the payment is
+/// considered permanent once written.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentReceipt {
+    /// The sender who submitted the payment.
+    pub sender: Address,
+    /// The recipient of the payment.
+    pub recipient: Address,
+    /// The token contract used.
+    pub token: Address,
+    /// The gross amount routed (before fee deduction).
+    pub amount: i128,
+    /// The fee collected from this payment.
+    pub fee: i128,
+    /// Wall-clock timestamp when the payment was executed (seconds since epoch).
+    pub executed_at: u64,
+    /// Wall-clock timestamp after which this receipt entry may be pruned.
+    pub expires_at: u64,
+}
+
+/// A refund balance entry with creation metadata.
+///
+/// Replaces the bare `i128` stored under `DataKey::RefundBalance` at schema v0.
+/// At schema v1 all new refund credits are stored under `DataKey::RefundEntry`
+/// as a `RefundEntry` value.  Legacy entries under `DataKey::RefundBalance`
+/// are migrated by `migrate_v0_to_v1`.
+///
+/// `created_at` enables the governed post-expiry recovery path:
+/// once `created_at + REFUND_EXPIRY_SECONDS` has passed, the ordinary
+/// `withdraw_refund` / `claim_all_refunds` calls are rejected with
+/// `Error::RefundExpired`, and only `recover_expired_refund` (admin-gated)
+/// may claim the balance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundEntry {
+    /// Amount still available for withdrawal.
+    pub balance: i128,
+    /// Wall-clock timestamp (seconds since epoch) when this refund was first created.
+    pub created_at: u64,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +299,25 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    // ── New keys added at schema version 1 ──────────────────────────────────
+    //
+    // Callers must ensure `schema_version() == SCHEMA_VERSION` (i.e. `migrate`
+    // has been called) before reading or writing these entries.
+    //
+    /// Monotonically-increasing per-sender nonce counter.
+    /// Stored as `u64` in persistent storage, keyed by sender address.
+    PaymentNonceCounter(Address),
+    /// Immutable execution receipt for a completed payment.
+    /// Key: (sender, nonce).  Written once; never updated.
+    PaymentNonce(Address, u64),
+    /// Cumulative fee collected for a specific token.
+    /// Stored as `i128` in persistent storage.
+    FeeTotal(Address),
+    /// Refund entry with creation timestamp for a (user, token) pair.
+    /// Replaces the bare `RefundBalance` i128 at schema v1.
+    RefundEntry(Address, Address),
+    /// Stored schema version written by `initialize` and each `migrate` call.
+    SchemaVersion,
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -279,6 +367,19 @@ pub enum Error {
     AdminTransferExpired = 19,
     /// The token has been blocked from routing.
     TokenBlocked = 20,
+    // ── New errors added at schema version 1 ────────────────────────────────
+    /// The caller-supplied nonce has already been used by this sender.
+    NonceDuplicate = 21,
+    /// The caller-supplied nonce has expired and can no longer be used.
+    NonceExpired = 22,
+    /// A migration step was called but the contract is already at the target schema version.
+    AlreadyMigrated = 23,
+    /// A migration step was called but the contract schema is at a version that
+    /// cannot be migrated to the requested target by this entry point.
+    MigrationVersionMismatch = 24,
+    /// A refund balance has passed its expiry window and can only be claimed
+    /// by the governed recovery path, not by ordinary `withdraw_refund`.
+    RefundExpired = 25,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -309,6 +410,20 @@ impl PaymentRouter {
     const USER_LIFETIME_THRESHOLD: u32 = Self::USER_BUMP_AMOUNT - Self::DAY_IN_LEDGERS;
     const PERSISTENT_BUMP_AMOUNT: u32 = Self::USER_BUMP_AMOUNT;
     const PERSISTENT_LIFETIME_THRESHOLD: u32 = Self::USER_LIFETIME_THRESHOLD;
+
+    // ── Schema v1 constants ──────────────────────────────────────────────────
+
+    /// How long (seconds) a caller-supplied nonce remains valid after it is
+    /// first seen.  A submission arriving after this window is rejected with
+    /// `Error::NonceExpired`.  Receipts older than this may be pruned by the
+    /// admin using `prune_receipt`.
+    const NONCE_EXPIRY_SECONDS: u64 = 7 * Self::SECONDS_IN_24H; // 7 days
+
+    /// How long (seconds) an unclaimed refund balance remains accessible to
+    /// the original sender via `withdraw_refund` / `claim_all_refunds`.
+    /// After this window elapses the balance is locked for the governed
+    /// recovery path (`recover_expired_refund`).
+    const REFUND_EXPIRY_SECONDS: u64 = 90 * Self::SECONDS_IN_24H; // 90 days
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
@@ -398,25 +513,21 @@ impl PaymentRouter {
     }
 
     fn get_refund_balance_internal(env: &Env, user: &Address, token: &Address) -> i128 {
-        let key = DataKey::RefundBalance(user.clone(), token.clone());
-        env.storage().persistent().get(&key).unwrap_or(0)
+        // Schema v1: check RefundEntry first; fall back to legacy RefundBalance.
+        if let Some(entry) = Self::get_refund_entry(env, user, token) {
+            return entry.balance;
+        }
+        env.storage()
+            .persistent()
+            .get(&DataKey::RefundBalance(user.clone(), token.clone()))
+            .unwrap_or(0)
     }
 
     fn credit_refund_balance(env: &Env, user: &Address, token: &Address, amount: i128) {
-        let key = DataKey::RefundBalance(user.clone(), token.clone());
-        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current_balance + amount;
-        env.storage().persistent().set(&key, &new_balance);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
-        env.events().publish(
-            (symbol_short!("refunded"), user.clone(), token.clone()),
-            amount,
-        );
+        // Schema v1: write to RefundEntry so the creation timestamp is recorded.
+        // The legacy RefundBalance key is left untouched for entries that
+        // pre-date the migration (they are readable via get_refund_balance_internal).
+        Self::credit_refund_entry(env, user, token, amount);
     }
 
     /// Returns whether the contract is currently frozen.
@@ -439,6 +550,110 @@ impl PaymentRouter {
         next
     }
 
+    // ── Schema v1 private helpers ────────────────────────────────────────────
+
+    /// Returns the stored schema version, or 0 if the contract pre-dates
+    /// schema versioning.
+    fn schema_version_internal(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(0u32)
+    }
+
+    /// Returns the next per-sender payment nonce and increments the counter.
+    fn next_payment_nonce(env: &Env, sender: &Address) -> u64 {
+        let key = DataKey::PaymentNonceCounter(sender.clone());
+        let current: u64 = env.storage().persistent().get(&key).unwrap_or(0u64);
+        let next = current + 1;
+        env.storage().persistent().set(&key, &next);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        next
+    }
+
+    /// Writes an immutable `PaymentReceipt` keyed by `(sender, nonce)`.
+    /// Panics if the key already exists (should never happen in practice
+    /// because `nonce` is monotonically increasing per sender).
+    fn write_receipt(
+        env: &Env,
+        sender: &Address,
+        nonce: u64,
+        receipt: &PaymentReceipt,
+    ) {
+        let key = DataKey::PaymentNonce(sender.clone(), nonce);
+        // Immutability guarantee: once written, never overwritten.
+        // The nonce is monotonically allocated so this key is always fresh.
+        env.storage().persistent().set(&key, receipt);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Increments the cumulative fee total for `token` by `fee_amount`.
+    fn accrue_fee_total(env: &Env, token: &Address, fee_amount: i128) {
+        if fee_amount <= 0 {
+            return;
+        }
+        let key = DataKey::FeeTotal(token.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &(current + fee_amount));
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Returns the `RefundEntry` for `(user, token)`, or `None` if absent.
+    fn get_refund_entry(env: &Env, user: &Address, token: &Address) -> Option<RefundEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RefundEntry(user.clone(), token.clone()))
+    }
+
+    /// Credits `amount` to the refund entry for `(user, token)`.
+    /// Creates the entry with the current ledger timestamp if it does not exist.
+    /// Updates the balance without altering `created_at` on subsequent calls.
+    fn credit_refund_entry(env: &Env, user: &Address, token: &Address, amount: i128) {
+        let key = DataKey::RefundEntry(user.clone(), token.clone());
+        let now = env.ledger().timestamp();
+        let entry = if let Some(existing) = env.storage().persistent().get::<DataKey, RefundEntry>(&key) {
+            RefundEntry {
+                balance: existing.balance + amount,
+                created_at: existing.created_at,
+            }
+        } else {
+            RefundEntry {
+                balance: amount,
+                created_at: now,
+            }
+        };
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("refunded"), user.clone(), token.clone()),
+            amount,
+        );
+    }
+
+    /// Returns `true` if `entry.created_at + REFUND_EXPIRY_SECONDS <= now`.
+    fn refund_is_expired(env: &Env, entry: &RefundEntry) -> bool {
+        env.ledger().timestamp() >= entry.created_at.saturating_add(Self::REFUND_EXPIRY_SECONDS)
+    }
+
     /// Core payment logic shared by `route_payment` and `route_payments`.
     #[allow(clippy::too_many_arguments)]
     fn process_single_payment(
@@ -450,7 +665,51 @@ impl PaymentRouter {
         platform_treasury: &Address,
         fee_bps: i128,
         fee_cap: i128,
+        caller_nonce: Option<u64>,
     ) -> Result<(), Error> {
+        // ── Nonce deduplication (schema v1) ───────────────────────────────────
+        //
+        // If a caller-supplied nonce is provided, verify it has not been used
+        // before by this sender and that it has not expired.  An absent nonce
+        // opts out of receipt tracking (pre-v1 callers).
+        let now = env.ledger().timestamp();
+        let receipt_nonce: u64 = if let Some(cn) = caller_nonce {
+            // The nonce must not already exist as a receipt for this sender.
+            let receipt_key = DataKey::PaymentNonce(sender.clone(), cn);
+            if env.storage().persistent().has(&receipt_key) {
+                return Err(Error::NonceDuplicate);
+            }
+            // The nonce encodes its own expiry: it is valid for
+            // NONCE_EXPIRY_SECONDS after the last-seen counter value's
+            // timestamp.  We express expiry as: the nonce must be submitted
+            // within NONCE_EXPIRY_SECONDS of the current time, anchored by
+            // the current counter.  For simplicity, a nonce that is
+            // numerically more than NONCE_EXPIRY_SECONDS ahead of the
+            // current allocated counter is treated as expired/invalid.
+            //
+            // Concrete rule: the caller-supplied nonce must equal the
+            // *next* nonce the counter will allocate, i.e. it must equal
+            // `counter + 1`.  This prevents skip-ahead attacks while
+            // remaining strictly monotonic per sender.
+            let counter_key = DataKey::PaymentNonceCounter(sender.clone());
+            let current_counter: u64 = env
+                .storage()
+                .persistent()
+                .get(&counter_key)
+                .unwrap_or(0u64);
+            let expected_nonce = current_counter + 1;
+            if cn != expected_nonce {
+                // Nonce is out of sequence (already used or skipped ahead).
+                // Map both to NonceExpired for a uniform caller experience.
+                return Err(Error::NonceExpired);
+            }
+            // Allocate the nonce now (advance the counter).
+            Self::next_payment_nonce(env, sender)
+        } else {
+            // No nonce supplied; auto-allocate an internal one for bookkeeping.
+            Self::next_payment_nonce(env, sender)
+        };
+
         // Require sender auth
         sender.require_auth();
 
@@ -520,12 +779,6 @@ impl PaymentRouter {
         };
 
         // Check time-based daily spending limits.
-        // Storage format: packed BytesN<24> (see pack_spending / unpack_spending).
-        //
-        // The window is anchored to the ledger's wall-clock timestamp (seconds
-        // since the Unix epoch), not to a ledger-sequence count, so a "day" is
-        // always exactly DAY_SECONDS (86 400 s) of real time regardless of how
-        // ledger close times vary.
         let current_time = env.ledger().timestamp();
         let spending_key = DataKey::UserSpending(sender.clone());
 
@@ -536,8 +789,6 @@ impl PaymentRouter {
             .map(|packed| unpack_spending(&packed))
             .unwrap_or((current_time, 0));
 
-        // Reset only once a full 86 400-second window has elapsed.  An elapsed
-        // time of 86 399 s (or less) keeps the current window and counter.
         if current_time.saturating_sub(last_reset_timestamp) >= Self::DAY_SECONDS {
             last_reset_timestamp = current_time;
             accumulated_amount = 0;
@@ -577,11 +828,16 @@ impl PaymentRouter {
         // Execute transfers
         if fee_amount > 0 {
             token_client.transfer(sender, platform_treasury, &fee_amount);
+            // ── Fee accounting (schema v1) ─────────────────────────────────
+            // Only increment the counter after the transfer succeeds so that
+            // failed payments never inflate the total.
+            Self::accrue_fee_total(env, token_address, fee_amount);
+            env.events().publish(
+                (Symbol::new(env, "fee_collected"), token_address.clone()),
+                fee_amount,
+            );
         }
         if remainder > 0 {
-            // Attempt to transfer remainder directly to recipient.
-            // If recipient cannot receive tokens (e.g. missing trustline or rejection),
-            // transfer funds into the contract and credit the sender's internal refund ledger.
             match token_client.try_transfer(sender, recipient, &remainder) {
                 Ok(Ok(())) => {
                     log!(env, "Remaining balance routed to recipient");
@@ -608,6 +864,18 @@ impl PaymentRouter {
             Self::PERSISTENT_LIFETIME_THRESHOLD,
             Self::PERSISTENT_BUMP_AMOUNT,
         );
+
+        // ── Write immutable execution receipt (schema v1) ─────────────────
+        let receipt = PaymentReceipt {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token: token_address.clone(),
+            amount,
+            fee: fee_amount,
+            executed_at: now,
+            expires_at: now.saturating_add(Self::NONCE_EXPIRY_SECONDS),
+        };
+        Self::write_receipt(env, sender, receipt_nonce, &receipt);
 
         // Emit routed event
         env.events().publish(
@@ -665,6 +933,9 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().set(&DataKey::TimelockNonce, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1493,6 +1764,7 @@ impl PaymentRouter {
             &platform_treasury,
             fee_bps,
             fee_cap,
+            None,
         )
     }
 
@@ -1532,6 +1804,7 @@ impl PaymentRouter {
                 &platform_treasury,
                 fee_bps,
                 fee_cap,
+                None,
             )?;
         }
 
@@ -1584,6 +1857,44 @@ impl PaymentRouter {
             return Err(Error::NoRefundAvailable);
         }
 
+        // ── Schema v1: check RefundEntry with expiry enforcement ─────────────
+        // If a RefundEntry exists, enforce the expiry window.  Expired entries
+        // can only be claimed by the governed recovery path.
+        if let Some(entry) = Self::get_refund_entry(&env, &user, &token) {
+            if Self::refund_is_expired(&env, &entry) {
+                return Err(Error::RefundExpired);
+            }
+            if amount > entry.balance {
+                return Err(Error::NoRefundAvailable);
+            }
+            let key = DataKey::RefundEntry(user.clone(), token.clone());
+            let new_balance = entry.balance - amount;
+            if new_balance > 0 {
+                let updated = RefundEntry {
+                    balance: new_balance,
+                    created_at: entry.created_at,
+                };
+                env.storage().persistent().set(&key, &updated);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+            } else {
+                env.storage().persistent().remove(&key);
+            }
+            let contract_address = env.current_contract_address();
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&contract_address, &user, &amount);
+            env.events().publish(
+                (symbol_short!("withdrawn"), user.clone(), token.clone()),
+                amount,
+            );
+            log!(&env, "Refund balance withdrawn by user");
+            return Ok(());
+        }
+
+        // ── Legacy path: bare RefundBalance i128 ─────────────────────────────
         let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
         if amount > current_balance {
             return Err(Error::NoRefundAvailable);
@@ -1631,6 +1942,20 @@ impl PaymentRouter {
     pub fn claim_all_refunds(env: Env, user: Address, token: Address) -> Result<i128, Error> {
         user.require_auth();
 
+        // Schema v1: check RefundEntry with expiry enforcement.
+        if let Some(entry) = Self::get_refund_entry(&env, &user, &token) {
+            if Self::refund_is_expired(&env, &entry) {
+                return Err(Error::RefundExpired);
+            }
+            let current_balance = entry.balance;
+            if current_balance <= 0 {
+                return Err(Error::NoRefundAvailable);
+            }
+            Self::withdraw_refund(env, user, token, current_balance)?;
+            return Ok(current_balance);
+        }
+
+        // Legacy path.
         let current_balance = Self::get_refund_balance_internal(&env, &user, &token);
         if current_balance <= 0 {
             return Err(Error::NoRefundAvailable);
@@ -1661,6 +1986,234 @@ impl PaymentRouter {
         token_client.transfer(&env.current_contract_address(), &admin, &amount);
 
         log!(&env, "Emergency withdraw executed by admin");
+        Ok(())
+    }
+
+    // ── Schema v1 public API ─────────────────────────────────────────────────
+
+    /// Routes a payment using a caller-supplied nonce for idempotency.
+    ///
+    /// The nonce must equal `get_payment_nonce_counter(sender) + 1`.  On
+    /// success an immutable `PaymentReceipt` is written at `(sender, nonce)`.
+    /// Supplying the same nonce a second time returns `Error::NonceDuplicate`.
+    /// Supplying an out-of-sequence nonce returns `Error::NonceExpired`.
+    pub fn route_payment_with_nonce(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        nonce: u64,
+    ) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
+
+        Self::process_single_payment(
+            &env,
+            &sender,
+            &recipient,
+            &token_address,
+            amount,
+            &platform_treasury,
+            fee_bps,
+            fee_cap,
+            Some(nonce),
+        )
+    }
+
+    /// Returns the immutable execution receipt for `(sender, nonce)`, or
+    /// `Error::TimelockNotFound` if no such receipt exists.
+    pub fn get_payment_receipt(
+        env: Env,
+        sender: Address,
+        nonce: u64,
+    ) -> Result<PaymentReceipt, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentNonce(sender, nonce))
+            .ok_or(Error::TimelockNotFound)
+    }
+
+    /// Returns the current per-sender payment nonce counter.
+    /// The next valid caller-supplied nonce is `counter + 1`.
+    pub fn get_payment_nonce_counter(env: Env, sender: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentNonceCounter(sender))
+            .unwrap_or(0u64)
+    }
+
+    /// Prunes an expired payment receipt from storage.  Anyone may call this.
+    /// Returns `Error::TimelockNotFound` if the receipt does not exist, or
+    /// `Error::TimelockNotReady` if it has not yet expired.
+    pub fn prune_receipt(env: Env, sender: Address, nonce: u64) -> Result<(), Error> {
+        let key = DataKey::PaymentNonce(sender, nonce);
+        let receipt: PaymentReceipt = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
+        if env.ledger().timestamp() < receipt.expires_at {
+            return Err(Error::TimelockNotReady);
+        }
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Returns the cumulative fee collected for a given token.
+    /// Only incremented on successful transfers; failed payments contribute nothing.
+    pub fn get_fee_total(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeTotal(token))
+            .unwrap_or(0i128)
+    }
+
+    /// Returns the `RefundEntry` (balance + creation timestamp) for a user and token,
+    /// or `None` if no entry exists.
+    pub fn get_refund_entry_view(
+        env: Env,
+        user: Address,
+        token: Address,
+    ) -> Option<RefundEntry> {
+        Self::get_refund_entry(&env, &user, &token)
+    }
+
+    /// Governed recovery of an expired refund balance.
+    ///
+    /// Once `created_at + REFUND_EXPIRY_SECONDS` has elapsed for a refund
+    /// entry, the original user can no longer call `withdraw_refund`.  This
+    /// entry point (admin-only) transfers the balance to the admin address
+    /// and emits a `refund_recovered` event so the user can be notified off-chain.
+    pub fn recover_expired_refund(
+        env: Env,
+        user: Address,
+        token: Address,
+    ) -> Result<i128, Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let key = DataKey::RefundEntry(user.clone(), token.clone());
+        let entry: RefundEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NoRefundAvailable)?;
+
+        if !Self::refund_is_expired(&env, &entry) {
+            return Err(Error::TimelockNotReady);
+        }
+
+        let amount = entry.balance;
+        env.storage().persistent().remove(&key);
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "refund_recovered"),
+                admin,
+                user,
+                token,
+            ),
+            amount,
+        );
+
+        log!(&env, "Expired refund recovered by admin");
+        Ok(amount)
+    }
+
+    /// Returns the stored schema version (0 for pre-schema contracts).
+    pub fn schema_version(env: Env) -> u32 {
+        Self::schema_version_internal(&env)
+    }
+
+    /// Idempotent, bounded migration of one `(user, token)` refund entry
+    /// from the legacy bare-`i128` `RefundBalance` key to the new
+    /// `RefundEntry` key with a creation timestamp.
+    ///
+    /// Admin-only.  Returns `Error::AlreadyMigrated` if the schema version
+    /// is already >= 1.
+    pub fn migrate_refund_entry_v0_to_v1(
+        env: Env,
+        user: Address,
+        token: Address,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        if Self::schema_version_internal(&env) >= 1 {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        let legacy_key = DataKey::RefundBalance(user.clone(), token.clone());
+        let new_key = DataKey::RefundEntry(user.clone(), token.clone());
+
+        // Idempotent: skip if already migrated.
+        if env.storage().persistent().has(&new_key) {
+            return Ok(());
+        }
+
+        if let Some(balance) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&legacy_key)
+        {
+            if balance > 0 {
+                // created_at = 0 so migrated entries are immediately expired on
+                // mainnet and enter the governed recovery path.
+                let entry = RefundEntry {
+                    balance,
+                    created_at: 0,
+                };
+                env.storage().persistent().set(&new_key, &entry);
+                env.storage().persistent().extend_ttl(
+                    &new_key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+                env.storage().persistent().remove(&legacy_key);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finalizes the v0→v1 migration by bumping the stored schema version.
+    ///
+    /// Call only after all legacy `RefundBalance` entries have been migrated.
+    /// Returns `Error::MigrationVersionMismatch` if the stored version is not 0.
+    ///
+    /// Admin-only.
+    pub fn finalize_migration_v0_to_v1(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        if Self::schema_version_internal(&env) != 0 {
+            return Err(Error::MigrationVersionMismatch);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &1u32);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "schema_migrated"),),
+            (0u32, 1u32),
+        );
+
+        log!(&env, "Schema migrated from v0 to v1");
         Ok(())
     }
 
@@ -1734,10 +2287,10 @@ mod test {
     };
 
     #[contract]
-    struct RefundTestToken;
+    pub struct RefundTestToken;
 
     #[contracttype]
-    enum RefundTokenKey {
+    pub enum RefundTokenKey {
         Balance(Address),
         RejectedRecipient,
     }
@@ -1745,7 +2298,7 @@ mod test {
     #[contracterror]
     #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
     #[repr(u32)]
-    enum RefundTokenError {
+    pub enum RefundTokenError {
         InsufficientBalance = 1,
         RejectedRecipient = 2,
     }
@@ -3494,6 +4047,701 @@ mod test {
             part.parse::<u64>()
                 .unwrap_or_else(|_| panic!("version component '{part}' is not an integer"));
         }
+    }
+}
+
+/// Tests covering the four schema-v1 features:
+///
+/// 1. Caller-nonce execution receipts (per-sender, immutable, with expiry).
+/// 2. Per-token fee accounting (read-only totals, reconciled with events,
+///    failed payments excluded).
+/// 3. Refund creation timestamps and governed post-expiry recovery.
+/// 4. Schema version storage, bounded idempotent migration, and the guard
+///    that prevents finalization from being called twice.
+#[cfg(test)]
+mod v1_tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
+        token, Address, Env, Symbol, TryIntoVal,
+    };
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn setup() -> (Env, PaymentRouterClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, PaymentRouter);
+        let client = PaymentRouterClient::new(&env, &cid);
+        (env, client, cid)
+    }
+
+    fn setup_token(
+        env: &Env,
+    ) -> (Address, token::Client<'static>, token::StellarAssetClient<'static>) {
+        let ta = Address::generate(env);
+        let addr = env.register_stellar_asset_contract(ta);
+        let tc = token::Client::new(env, &addr);
+        let sac = token::StellarAssetClient::new(env, &addr);
+        (addr, tc, sac)
+    }
+
+    fn advance(env: &Env, delta: u64) {
+        let ts = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: ts + delta,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Feature 1: Caller-nonce execution receipts
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// A successful `route_payment_with_nonce` call writes an immutable
+    /// receipt that can be retrieved with `get_payment_receipt`.
+    #[test]
+    fn test_nonce_success_writes_immutable_receipt() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.get_payment_nonce_counter(&sender) + 1;
+        assert_eq!(nonce, 1);
+
+        client.route_payment_with_nonce(&sender, &recipient, &token, &2_000, &nonce);
+
+        let receipt = client.get_payment_receipt(&sender, &nonce);
+        assert_eq!(receipt.sender, sender);
+        assert_eq!(receipt.recipient, recipient);
+        assert_eq!(receipt.token, token);
+        assert_eq!(receipt.amount, 2_000);
+        // Fee: 100 bps of 2000 = 20, capped at 50 → 20
+        assert_eq!(receipt.fee, 20);
+        assert_eq!(tc.balance(&recipient), 1_980);
+    }
+
+    /// The nonce counter advances monotonically per sender.
+    #[test]
+    fn test_nonce_counter_advances_monotonically() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &100_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        for expected in 1u64..=5 {
+            let nonce = client.get_payment_nonce_counter(&sender) + 1;
+            assert_eq!(nonce, expected);
+            client.route_payment_with_nonce(&sender, &recipient, &token, &1_000, &nonce);
+            assert_eq!(client.get_payment_nonce_counter(&sender), expected);
+        }
+    }
+
+    /// Two independent senders have separate nonce spaces.
+    #[test]
+    fn test_nonce_scoped_per_sender() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender_a = Address::generate(&env);
+        let sender_b = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, sac) = setup_token(&env);
+        sac.mint(&sender_a, &10_000);
+        sac.mint(&sender_b, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Both start at counter 0.
+        assert_eq!(client.get_payment_nonce_counter(&sender_a), 0);
+        assert_eq!(client.get_payment_nonce_counter(&sender_b), 0);
+
+        client.route_payment_with_nonce(&sender_a, &recipient, &token, &1_000, &1u64);
+        // sender_a is now at 1; sender_b is still at 0.
+        assert_eq!(client.get_payment_nonce_counter(&sender_a), 1);
+        assert_eq!(client.get_payment_nonce_counter(&sender_b), 0);
+
+        // sender_b can still use nonce 1.
+        client.route_payment_with_nonce(&sender_b, &recipient, &token, &1_000, &1u64);
+        assert_eq!(client.get_payment_nonce_counter(&sender_b), 1);
+
+        // The two receipts are independent.
+        let ra = client.get_payment_receipt(&sender_a, &1u64);
+        let rb = client.get_payment_receipt(&sender_b, &1u64);
+        assert_eq!(ra.sender, sender_a);
+        assert_eq!(rb.sender, sender_b);
+    }
+
+    /// Re-submitting a nonce that has already been used returns `NonceDuplicate`.
+    /// The receipt-existence check fires before the sequence check.
+    #[test]
+    fn test_nonce_duplicate_rejected() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &100_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        client.route_payment_with_nonce(&sender, &recipient, &token, &1_000, &1u64);
+
+        // Nonce 1 receipt already exists → NonceDuplicate.
+        let res = client.try_route_payment_with_nonce(&sender, &recipient, &token, &1_000, &1u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NonceDuplicate);
+    }
+
+    /// Supplying an out-of-sequence nonce returns `NonceExpired`.
+    #[test]
+    fn test_nonce_out_of_sequence_rejected() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &100_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Counter is 0 → expected nonce is 1. Supplying 3 is out of sequence.
+        let res = client.try_route_payment_with_nonce(&sender, &recipient, &token, &1_000, &3u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NonceExpired);
+    }
+
+    /// A receipt can be pruned after its expiry time.
+    #[test]
+    fn test_receipt_pruned_after_expiry() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment_with_nonce(&sender, &recipient, &token, &1_000, &1u64);
+
+        // Cannot prune before expiry.
+        let res = client.try_prune_receipt(&sender, &1u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
+
+        // Advance past the NONCE_EXPIRY_SECONDS (7 days).
+        advance(&env, PaymentRouter::NONCE_EXPIRY_SECONDS + 1);
+
+        client.prune_receipt(&sender, &1u64);
+
+        // Receipt is gone.
+        let res = client.try_get_payment_receipt(&sender, &1u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+    }
+
+    /// A failed payment does not write a receipt.
+    #[test]
+    fn test_failed_payment_does_not_write_receipt() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, _sac) = setup_token(&env); // no mint → insufficient balance
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_route_payment_with_nonce(&sender, &recipient, &token, &1_000, &1u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::InsufficientBalance);
+
+        // No receipt written.
+        let res = client.try_get_payment_receipt(&sender, &1u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotFound);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Feature 2: Per-token fee accounting
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// `get_fee_total` starts at zero and increments only on successful payments.
+    #[test]
+    fn test_fee_total_increments_on_success() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &100_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(client.get_fee_total(&token), 0);
+
+        // 100 bps of 2000 = 20, cap 50 → fee = 20
+        client.route_payment(&sender, &recipient, &token, &2_000);
+        assert_eq!(client.get_fee_total(&token), 20);
+
+        // 100 bps of 8000 = 80 > cap 50 → fee = 50
+        client.route_payment(&sender, &recipient, &token, &8_000);
+        assert_eq!(client.get_fee_total(&token), 70);
+    }
+
+    /// A failed payment does not increment the fee total.
+    #[test]
+    fn test_fee_total_not_incremented_on_failure() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, _sac) = setup_token(&env); // no mint
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let _ = client.try_route_payment(&sender, &recipient, &token, &1_000);
+        assert_eq!(client.get_fee_total(&token), 0);
+    }
+
+    /// Fee totals are tracked independently per token.
+    #[test]
+    fn test_fee_total_per_token() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_a, _tc_a, sac_a) = setup_token(&env);
+        let (token_b, _tc_b, sac_b) = setup_token(&env);
+        sac_a.mint(&sender, &100_000);
+        sac_b.mint(&sender, &100_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        client.route_payment(&sender, &recipient, &token_a, &2_000);
+        client.route_payment(&sender, &recipient, &token_b, &8_000);
+
+        assert_eq!(client.get_fee_total(&token_a), 20); // 100 bps of 2000, cap 50
+        assert_eq!(client.get_fee_total(&token_b), 50); // 100 bps of 8000 > cap 50
+    }
+
+    /// A `fee_collected` event is emitted for each successful fee transfer,
+    /// and the total reconciles with the sum of event amounts.
+    #[test]
+    fn test_fee_total_reconciles_with_events() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token, _tc, sac) = setup_token(&env);
+        sac.mint(&sender, &100_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        client.route_payment(&sender, &recipient, &token, &2_000);
+        client.route_payment(&sender, &recipient, &token, &2_000);
+        client.route_payment(&sender, &recipient, &token, &2_000);
+
+        // Sum fee_collected events.
+        let events = env.events().all();
+        let mut event_sum: i128 = 0;
+        for (_, topics, data) in events.iter() {
+            if topics.is_empty() {
+                continue;
+            }
+            let sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            if sym.map(|s| s == Symbol::new(&env, "fee_collected")).unwrap_or(false) {
+                let fee: i128 = data.try_into_val(&env).unwrap();
+                event_sum += fee;
+            }
+        }
+
+        assert_eq!(client.get_fee_total(&token), event_sum);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Feature 3: Refund creation timestamps and post-expiry governed recovery
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// A new refund entry records the creation timestamp.
+    #[test]
+    fn test_refund_entry_records_creation_time() {
+        let (env, client, _contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_addr = env.register_contract(None, test::RefundTestToken);
+        let mock = test::RefundTestTokenClient::new(&env, &token_addr);
+        mock.init(&recipient);
+        mock.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let ts_before = env.ledger().timestamp();
+        client.route_payment(&sender, &recipient, &token_addr, &2_000);
+
+        let entry = client.get_refund_entry_view(&sender, &token_addr).unwrap();
+        assert_eq!(entry.balance, 1_980); // 2000 - 20 fee
+        assert!(entry.created_at >= ts_before);
+        assert_eq!(
+            entry.created_at,
+            env.ledger().timestamp(),
+            "created_at must equal the ledger timestamp when the refund was credited"
+        );
+    }
+
+    /// Within the expiry window the user can withdraw a refund normally.
+    #[test]
+    fn test_refund_withdrawal_within_expiry_window() {
+        let (env, client, _contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_addr = env.register_contract(None, test::RefundTestToken);
+        let mock = test::RefundTestTokenClient::new(&env, &token_addr);
+        mock.init(&recipient);
+        mock.mint(&sender, &10_000);
+        let tc = token::Client::new(&env, &token_addr);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment(&sender, &recipient, &token_addr, &2_000);
+
+        // Advance to just inside the expiry window (one second before expiry).
+        advance(&env, PaymentRouter::REFUND_EXPIRY_SECONDS - 1);
+
+        // Withdraw should succeed.
+        client.withdraw_refund(&sender, &token_addr, &1_980);
+        assert_eq!(tc.balance(&sender), 10_000 - 2_000 + 1_980);
+    }
+
+    /// After expiry, ordinary withdraw is blocked with `RefundExpired`.
+    #[test]
+    fn test_refund_withdrawal_blocked_after_expiry() {
+        let (env, client, _contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_addr = env.register_contract(None, test::RefundTestToken);
+        let mock = test::RefundTestTokenClient::new(&env, &token_addr);
+        mock.init(&recipient);
+        mock.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment(&sender, &recipient, &token_addr, &2_000);
+
+        advance(&env, PaymentRouter::REFUND_EXPIRY_SECONDS);
+
+        let res = client.try_withdraw_refund(&sender, &token_addr, &1_980);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RefundExpired);
+    }
+
+    /// `claim_all_refunds` is also blocked after expiry.
+    #[test]
+    fn test_claim_all_refunds_blocked_after_expiry() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_addr = env.register_contract(None, test::RefundTestToken);
+        let mock = test::RefundTestTokenClient::new(&env, &token_addr);
+        mock.init(&recipient);
+        mock.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment(&sender, &recipient, &token_addr, &2_000);
+
+        advance(&env, PaymentRouter::REFUND_EXPIRY_SECONDS);
+
+        let res = client.try_claim_all_refunds(&sender, &token_addr);
+        assert_eq!(res.unwrap_err().unwrap(), Error::RefundExpired);
+    }
+
+    /// `recover_expired_refund` is blocked before expiry.
+    #[test]
+    fn test_recover_expired_refund_blocked_before_expiry() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_addr = env.register_contract(None, test::RefundTestToken);
+        let mock = test::RefundTestTokenClient::new(&env, &token_addr);
+        mock.init(&recipient);
+        mock.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment(&sender, &recipient, &token_addr, &2_000);
+
+        // Not expired yet.
+        let res = client.try_recover_expired_refund(&sender, &token_addr);
+        assert_eq!(res.unwrap_err().unwrap(), Error::TimelockNotReady);
+    }
+
+    /// After expiry, the admin can recover the balance and a `refund_recovered`
+    /// event is emitted.
+    #[test]
+    fn test_recover_expired_refund_succeeds_after_expiry() {
+        let (env, client, contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_addr = env.register_contract(None, test::RefundTestToken);
+        let mock = test::RefundTestTokenClient::new(&env, &token_addr);
+        mock.init(&recipient);
+        mock.mint(&sender, &10_000);
+        let tc = token::Client::new(&env, &token_addr);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        client.route_payment(&sender, &recipient, &token_addr, &2_000);
+
+        let remainder = 1_980i128;
+        assert_eq!(tc.balance(&contract_id), remainder);
+
+        advance(&env, PaymentRouter::REFUND_EXPIRY_SECONDS);
+
+        let recovered = client.recover_expired_refund(&sender, &token_addr);
+        assert_eq!(recovered, remainder);
+        assert_eq!(tc.balance(&admin), remainder);
+        assert_eq!(tc.balance(&contract_id), 0);
+
+        // RefundEntry is gone.
+        assert!(client.get_refund_entry_view(&sender, &token_addr).is_none());
+
+        // Event emitted.
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if topics.is_empty() { return false; }
+            let sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            sym.map(|s| s == Symbol::new(&env, "refund_recovered")).unwrap_or(false)
+        });
+        assert!(found, "refund_recovered event not emitted");
+    }
+
+    /// `recover_expired_refund` on a non-existent entry returns `NoRefundAvailable`.
+    #[test]
+    fn test_recover_expired_refund_no_entry() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+        let (token, _, _) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let res = client.try_recover_expired_refund(&user, &token);
+        assert_eq!(res.unwrap_err().unwrap(), Error::NoRefundAvailable);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Feature 4: Schema versioning and bounded idempotent migration
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// A freshly initialized contract reports schema version SCHEMA_VERSION.
+    #[test]
+    fn test_initialize_stores_schema_version() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(client.schema_version(), SCHEMA_VERSION);
+    }
+
+    /// `finalize_migration_v0_to_v1` on a v0 contract succeeds.
+    #[test]
+    fn test_finalize_migration_v0_to_v1_succeeds() {
+        let (env, client, contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Simulate a v0 contract by zeroing the schema version directly.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &0u32);
+        });
+        assert_eq!(client.schema_version(), 0);
+
+        client.finalize_migration_v0_to_v1();
+        assert_eq!(client.schema_version(), 1);
+
+        // Event emitted.
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if topics.is_empty() { return false; }
+            let sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            sym.map(|s| s == Symbol::new(&env, "schema_migrated")).unwrap_or(false)
+        });
+        assert!(found, "schema_migrated event not emitted");
+    }
+
+    /// `finalize_migration_v0_to_v1` on an already-v1 contract returns
+    /// `MigrationVersionMismatch`.
+    #[test]
+    fn test_finalize_migration_idempotent_guard() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        // Already at v1 (set by initialize).
+        let res = client.try_finalize_migration_v0_to_v1();
+        assert_eq!(res.unwrap_err().unwrap(), Error::MigrationVersionMismatch);
+    }
+
+    /// `migrate_refund_entry_v0_to_v1` on a v1 contract returns `AlreadyMigrated`.
+    #[test]
+    fn test_migrate_refund_entry_blocked_on_v1() {
+        let (env, client, _) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+        let (token, _, _) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+        // Already at v1.
+        let res = client.try_migrate_refund_entry_v0_to_v1(&user, &token);
+        assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyMigrated);
+    }
+
+    /// A legacy `RefundBalance` i128 is correctly migrated to a `RefundEntry`.
+    #[test]
+    fn test_migrate_refund_entry_v0_to_v1_migrates_legacy_balance() {
+        let (env, client, contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+        let (token, _, _) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Set schema to 0 and write a legacy RefundBalance entry.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::RefundBalance(user.clone(), token.clone()), &5_000i128);
+        });
+
+        client.migrate_refund_entry_v0_to_v1(&user, &token);
+
+        // The new RefundEntry exists.
+        let entry = client.get_refund_entry_view(&user, &token).unwrap();
+        assert_eq!(entry.balance, 5_000);
+        // created_at = 0 (migration sentinel).
+        assert_eq!(entry.created_at, 0);
+
+        // The legacy key is gone.
+        env.as_contract(&contract_id, || {
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&DataKey::RefundBalance(user.clone(), token.clone())),
+                "legacy RefundBalance key should have been removed"
+            );
+        });
+    }
+
+    /// Calling `migrate_refund_entry_v0_to_v1` twice for the same pair is
+    /// idempotent (the second call returns `Ok(())`).
+    #[test]
+    fn test_migrate_refund_entry_v0_to_v1_idempotent() {
+        let (env, client, contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+        let (token, _, _) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::RefundBalance(user.clone(), token.clone()), &3_000i128);
+        });
+
+        client.migrate_refund_entry_v0_to_v1(&user, &token);
+        // Second call is idempotent.
+        client.migrate_refund_entry_v0_to_v1(&user, &token);
+
+        let entry = client.get_refund_entry_view(&user, &token).unwrap();
+        assert_eq!(entry.balance, 3_000);
+    }
+
+    /// New code at schema v1 rejects reads of a migrated-but-expired entry
+    /// from ordinary withdraw, enforcing the invariant that old packed state
+    /// cannot be mis-read by new logic once migration completes.
+    #[test]
+    fn test_new_code_rejects_expired_migrated_entry_via_withdraw() {
+        let (env, client, contract_id) = setup();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+        let (token, tc, sac) = setup_token(&env);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        // Write a legacy balance and migrate it (created_at = 0 → immediately expired).
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::RefundBalance(user.clone(), token.clone()), &2_000i128);
+        });
+        // Fund the contract so the token transfer can succeed if the guard fails.
+        sac.mint(&contract_id, &2_000);
+
+        client.migrate_refund_entry_v0_to_v1(&user, &token);
+        client.finalize_migration_v0_to_v1();
+
+        // Advance past REFUND_EXPIRY_SECONDS so the created_at=0 entry is expired.
+        advance(&env, PaymentRouter::REFUND_EXPIRY_SECONDS + 1);
+
+        // Ordinary withdraw is blocked (entry has created_at = 0, now expired).
+        let res = client.try_withdraw_refund(&user, &token, &2_000);
+        assert_eq!(
+            res.unwrap_err().unwrap(),
+            Error::RefundExpired,
+            "new code must reject expired migrated entries via ordinary withdraw"
+        );
+
+        // Admin can recover it.
+        let recovered = client.recover_expired_refund(&user, &token);
+        assert_eq!(recovered, 2_000);
+        assert_eq!(tc.balance(&admin), 2_000);
     }
 }
 

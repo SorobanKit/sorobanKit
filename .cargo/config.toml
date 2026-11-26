@@ -53,6 +53,6 @@ incremental = false
 # Pin the target used for Soroban contract builds so the toolchain resolves the
 # same std/core artifacts everywhere. `wasm32-unknown-unknown` is the only
 # target the Soroban optimizer accepts.
-[build.target]
+#
 # (intentionally left unset here; the build script passes `--target` explicitly
 # so host-side `cargo test` keeps working. See `scripts/build-wasm.sh`.)
