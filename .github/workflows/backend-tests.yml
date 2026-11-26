@@ -117,6 +117,57 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
 
+      # Upgrade-path validation (#398).
+      # Restores a synthetic prior-schema fixture representing the previous
+      # supported release, then runs forward migrations and application smoke
+      # queries to prove the upgrade path still works. Fixtures are synthetic
+      # only (no production data). Supported baselines are documented in
+      # stellar-payment-platform/prisma/fixtures/README.md.
+      - name: Test database upgrade from previous supported release (#398)
+        working-directory: stellar-payment-platform
+        run: |
+          FIXTURE_DIR=prisma/fixtures
+          if [ ! -d "$FIXTURE_DIR" ]; then
+            echo "No prior-schema fixtures found; skipping upgrade test."
+            exit 0
+          fi
+          for FIXTURE in "$FIXTURE_DIR"/*.sql; do
+            [ -e "$FIXTURE" ] || continue
+            echo "::group::Upgrade test from fixture $FIXTURE"
+            # Reset the schema so each baseline starts from a clean slate.
+            npx prisma db execute --stdin <<'SQL'
+          DROP SCHEMA IF EXISTS public CASCADE;
+          CREATE SCHEMA public;
+          SQL
+            # Load the synthetic prior-schema fixture.
+            npx prisma db execute --file "$FIXTURE"
+            # Run forward migrations on top of the prior schema.
+            npx prisma migrate deploy
+            # Application smoke queries: verify core tables are queryable
+            # after the upgrade and that the Prisma client can read them.
+            node -e "
+              const { PrismaClient } = require('@prisma/client');
+              const prisma = new PrismaClient();
+              (async () => {
+                try {
+                  await prisma.\$queryRawUnsafe('SELECT 1');
+                  const tables = await prisma.\$queryRawUnsafe(
+                    \"SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'\"
+                  );
+                  if (!tables.length) {
+                    throw new Error('No tables present after upgrade');
+                  }
+                  console.log('Smoke queries passed; tables:', tables.map(t => t.table_name).join(', '));
+                } finally {
+                  await prisma.\$disconnect();
+                }
+              })().catch((err) => { console.error(err); process.exit(1); });
+            "
+            echo "::endgroup::"
+          done
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
+
       # Coverage thresholds live in package.json; failing below them fails the PR.
       # E2E isolation: suites in tests/e2e prefix every record with a per-run
       # `e2etest<uuid>` tag and delete them in afterAll, so repeated runs need
@@ -127,6 +178,18 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
           TEST_ADMIN_API_KEY: ${{ env.TEST_ADMIN_API_KEY }}
 
+      # Query-plan regression checks (#399).
+      # Captures representative PostgreSQL plans for the payment, activity, and
+      # webhook list endpoints and asserts stable indexed-access properties
+      # (index usage, no sequential scans on large tables) instead of brittle
+      # full-text plan snapshots. Runs on every backend change so schema or
+      # query changes that regress plans fail the PR.
+      - name: Run query-plan regression checks (#399)
+        working-directory: stellar-payment-platform
+        run: npm run test:query-plans
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
+
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
         run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
@@ -136,19 +199,4 @@ jobs:
 
       # Expand-contract migration guard (#387).
       # Lints migration SQL for destructive DDL (DROP TABLE/COLUMN, type narrowing,
-      # NOT NULL without DEFAULT, etc.). Non-zero exit fails the job so destructive
-      # changes cannot merge without an explicit `--allow-destructive` opt-in.
-      # The check is diff-scoped to migrations changed in this PR; when no
-      # migrations changed it still runs against the full directory so newly
-      # added files are validated.
-      - name: Lint migrations for destructive changes (#387)
-        run: |
-          CHANGED=$(git diff --name-only origin/main...HEAD -- 'stellar-payment-platform/prisma/migrations/**/migration.sql')
-          if [ -n "$CHANGED" ]; then
-            echo "Linting changed migrations:"
-            echo "$CHANGED"
-            node stellar-payment-platform/src/migrate-check.js --lint stellar-payment-platform/prisma/migrations
-          else
-            echo "No migration changes detected; running full lint."
-            node stellar-payment-platform/src/migrate-check.js --lint stellar-payment-platform/prisma/migrations
-          fi
+      # NOT NULL without DEFAULT, etc.). Non

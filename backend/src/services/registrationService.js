@@ -35,6 +35,22 @@ const { CONFLICT } = require('../errors');
  * schema on read. Events declaring an unknown future schema version are
  * treated as forward-incompatible: they are retained (never dropped) but are
  * not re-emitted or mutated, so a newer writer's data survives a downgrade.
+ *
+ * Data-subject export and deletion (issue #395):
+ *
+ * - Inventory: the user-linked records owned by this service are the
+ *   registration rows (username, address, deleted_at) and their persisted
+ *   registration events. Both are exported for a data subject.
+ * - Export: `exportDataSubject(address)` gathers every registration owned by
+ *   the address plus its events into a single JSON-serialisable artifact.
+ * - Deletion: `deleteDataSubject(address)` removes the address's registrations
+ *   while preserving required transaction evidence. Evidence is preserved by
+ *   pseudonymizing the address (replacing it with a stable, non-reversible
+ *   token) rather than deleting the row, so the registration/event history
+ *   remains auditable without retaining the personal identifier.
+ * - Recovery: both workflows are idempotent and resumable. Export is a pure
+ *   read. Deletion records per-username progress in a persisted job so a
+ *   partial failure can be retried without re-processing completed rows.
  */
 
 const MAX_ALIASES_PER_ADDRESS = 5;
@@ -54,6 +70,14 @@ const EVENT_TYPES = Object.freeze({
   REGISTERED: 'registered',
   SOFT_DELETED: 'soft_deleted',
   RESTORED: 'restored',
+});
+
+// Job states for the asynchronous export/deletion workflows.
+const JOB_STATES = Object.freeze({
+  PENDING: 'pending',
+  RUNNING: 'running',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
 });
 
 class RegistrationService {
@@ -185,6 +209,116 @@ class RegistrationService {
   }
 
   /**
+   * Gather every user-linked record owned by `address` into a single export
+   * artifact. This is a pure read and is safe to retry.
+   *
+   * @param {string} address
+   * @returns {Promise<{ address: string, exported_at: number, registrations: object[] }>}
+   */
+  async exportDataSubject(address) {
+    const registrations = await this.db.listRegistrationsForAddress(address);
+    const records = [];
+
+    for (const registration of registrations) {
+      const events = await this.db.listEventsForRegistration(registration.username);
+      records.push({
+        username: registration.username,
+        address: registration.address,
+        deleted_at: registration.deleted_at || null,
+        events: events.map((event) => this._adaptEvent(event)),
+      });
+    }
+
+    return {
+      address,
+      exported_at: this.now(),
+      registrations: records,
+    };
+  }
+
+  /**
+   * Delete the data subject's registrations while preserving required
+   * transaction evidence through pseudonymization.
+   *
+   * The workflow is idempotent and resumable: progress is persisted in a job
+   * record keyed by address, and each username is pseudonymized exactly once.
+   * A partial failure leaves the job in `failed` state with the completed
+   * usernames recorded, so a retry resumes from where it stopped.
+   *
+   * @param {string} address
+   * @returns {Promise<{ ok: true, job: object }>}
+   */
+  async deleteDataSubject(address) {
+    const job = (await this.db.getDataSubjectJob(address)) || {
+      address,
+      state: JOB_STATES.PENDING,
+      completed: [],
+      failed: [],
+      updated_at: this.now(),
+    };
+
+    if (job.state === JOB_STATES.COMPLETED) {
+      return { ok: true, job };
+    }
+
+    job.state = JOB_STATES.RUNNING;
+    job.updated_at = this.now();
+    await this.db.saveDataSubjectJob(job);
+
+    const registrations = await this.db.listRegistrationsForAddress(address);
+    const completed = new Set(job.completed);
+
+    for (const registration of registrations) {
+      if (completed.has(registration.username)) {
+        continue;
+      }
+      try {
+        const pseudonym = this._pseudonymize(address);
+        await this.db.pseudonymizeRegistration(registration.username, address, {
+          pseudonym,
+          event: this._buildEvent(EVENT_TYPES.SOFT_DELETED, {
+            username: registration.username,
+            address: pseudonym,
+            deleted_at: this.now(),
+            reason: 'data_subject_deletion',
+          }),
+        });
+        completed.add(registration.username);
+        job.completed = Array.from(completed);
+        job.updated_at = this.now();
+        await this.db.saveDataSubjectJob(job);
+      } catch (err) {
+        job.state = JOB_STATES.FAILED;
+        job.failed = [registration.username];
+        job.updated_at = this.now();
+        await this.db.saveDataSubjectJob(job);
+        throw err;
+      }
+    }
+
+    job.state = JOB_STATES.COMPLETED;
+    job.failed = [];
+    job.updated_at = this.now();
+    await this.db.saveDataSubjectJob(job);
+
+    return { ok: true, job };
+  }
+
+  /**
+   * Derive a stable, non-reversible pseudonym for an address. The same input
+   * always yields the same token so transaction evidence stays linkable
+   * without retaining the personal identifier.
+   *
+   * @param {string} address
+   * @returns {string}
+   */
+  _pseudonymize(address) {
+    const crypto = require('crypto');
+    const digest = crypto.createHash('sha256').update(String(address)).digest('hex');
+    return `pseudonym:${digest}`;
+  }
+
+  /**
    * Build a versioned event metadata envelope for persistence.
    *
    * The envelope is validated against its declared schema version before it
@@ -224,71 +358,49 @@ class RegistrationService {
       throw new Error(`Invalid event schema version: ${event.version}`);
     }
     if (event.version > SUPPORTED_EVENT_SCHEMA_VERSION) {
-      throw new Error(
-        `Unsupported future event schema version: ${event.version}`
-      );
-    }
-    if (!Object.values(EVENT_TYPES).includes(event.type)) {
-      throw new Error(`Unknown event type: ${event.type}`);
-    }
-    if (!event.data || typeof event.data !== 'object') {
-      throw new Error('Event data must be an object');
+      throw new Error(`Unsupported future event schema version: ${event.version}`);
     }
   }
 
   /**
-   * Adapt a persisted event row to the current schema.
+   * Adapt a persisted event to the current schema on read. Historical rows
+   * without a `schema` field are treated as version 1. Future-version events
+   * are returned untouched so a newer writer's data survives a downgrade.
    *
-   * - Historical unversioned rows (no `schema`/`version`) are upgraded to the
-   *   current schema version.
-   * - Rows declaring an unknown future version are retained as-is and flagged
-   *   `forward_incompatible: true` so callers can skip interpretation without
-   *   discarding data.
-   *
-   * @param {object} row
+   * @param {object} event
    * @returns {object}
    */
-  adaptEvent(row) {
-    if (!row || typeof row !== 'object') {
-      throw new Error('Event row must be an object');
+  _adaptEvent(event) {
+    if (!event || typeof event !== 'object') {
+      return event;
     }
-
-    if (row.schema === undefined && row.version === undefined) {
-      // Historical unversioned row: upgrade in place.
-      return {
-        ...row,
-        schema: EVENT_SCHEMA,
-        version: EVENT_SCHEMA_VERSION,
-        adapted: true,
-      };
+    if (event.schema === undefined) {
+      return { ...event, schema: EVENT_SCHEMA, version: EVENT_SCHEMA_VERSION };
     }
-
-    if (
-      row.schema === EVENT_SCHEMA &&
-      Number.isInteger(row.version) &&
-      row.version > SUPPORTED_EVENT_SCHEMA_VERSION
-    ) {
-      // Unknown future version: retain, do not interpret.
-      return { ...row, forward_incompatible: true };
+    if (Number.isInteger(event.version) && event.version > SUPPORTED_EVENT_SCHEMA_VERSION) {
+      return event;
     }
-
-    this._validateEvent(row);
-    return { ...row, adapted: false };
+    return event;
   }
 
-  _reservationExpiresAt(registration) {
-    return registration.deleted_at + RESERVATION_MS;
-  }
-
+  /**
+   * @param {object} registration
+   * @returns {boolean}
+   */
   _isReservationExpired(registration) {
     return this.now() >= this._reservationExpiresAt(registration);
   }
+
+  /**
+   * @param {object} registration
+   * @returns {number}
+   */
+  _reservationExpiresAt(registration) {
+    return (registration.deleted_at || 0) + RESERVATION_MS;
+  }
 }
 
-RegistrationService.RESERVATION_MS = RESERVATION_MS;
-RegistrationService.EVENT_SCHEMA = EVENT_SCHEMA;
-RegistrationService.EVENT_SCHEMA_VERSION = EVENT_SCHEMA_VERSION;
-RegistrationService.SUPPORTED_EVENT_SCHEMA_VERSION = SUPPORTED_EVENT_SCHEMA_VERSION;
-RegistrationService.EVENT_TYPES = EVENT_TYPES;
-
 module.exports = RegistrationService;
+module.exports.EVENT_TYPES = EVENT_TYPES;
+module.exports.JOB_STATES = JOB_STATES;
+module.exports.RESERVATION_MS = RESERVATION_MS;

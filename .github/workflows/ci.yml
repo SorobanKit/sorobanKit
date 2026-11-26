@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Scheduled point-in-time recovery drills (issue #396). Runs nightly.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      drill_target:
+        description: 'Isolated drill target environment (must not be production)'
+        required: false
+        default: 'drill'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,6 +40,99 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run ci:detect-changes -- --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+
+  # Scheduled point-in-time recovery (PITR) drill for PostgreSQL (issue #396).
+  # Restores a backup into an isolated, non-production target, validates critical
+  # row counts and invariants, and records achieved RPO/RTO. Never targets prod.
+  pitr-drill:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DRILL_ENVIRONMENT: ${{ github.event.inputs.drill_target || 'drill' }}
+      DRILL_DATABASE_URL: ${{ secrets.DRILL_DATABASE_URL }}
+      DRILL_BACKUP_SOURCE: ${{ secrets.DRILL_BACKUP_SOURCE }}
+      DRILL_RPO_TARGET_SECONDS: '900'
+      DRILL_RTO_TARGET_SECONDS: '3600'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Enforce non-production drill target (fail-closed)
+        run: |
+          set -euo pipefail
+          if [ -z "${DRILL_ENVIRONMENT:-}" ]; then
+            echo "DRILL_ENVIRONMENT is unset; refusing to run drill" >&2
+            exit 1
+          fi
+          case "${DRILL_ENVIRONMENT}" in
+            production|prod)
+              echo "Refusing to run PITR drill against production (${DRILL_ENVIRONMENT})" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "${DRILL_DATABASE_URL:-}" ]; then
+            echo "DRILL_DATABASE_URL is unset; refusing to run drill" >&2
+            exit 1
+          fi
+          echo "Drill target environment: ${DRILL_ENVIRONMENT}"
+      - name: Run scheduled PITR drill
+        run: npm run drill:pitr
+      - name: Upload drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitr-drill-report
+          path: |
+            drill-reports/**
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Upgrade-path tests (issue #398): load representative prior-schema fixtures
+  # for each supported baseline, run forward migrations, then execute
+  # application smoke queries. Fixtures are synthetic and live under
+  # backend/test/fixtures/upgrade-baselines/. Supported baselines are documented
+  # in CONTRIBUTING.md ("Database migrations").
+  upgrade-path:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: upgrade_user
+          POSTGRES_PASSWORD: upgrade_password
+          POSTGRES_DB: upgrade_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U upgrade_user -d upgrade_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://upgrade_user:upgrade_password@localhost:5432/upgrade_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Run upgrade-path tests (fixtures -> forward migrations -> smoke queries)
+        run: npm run test:upgrade-path
+      - name: Upload upgrade-path report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-path-report
+          path: |
+            upgrade-reports/**
+          if-no-files-found: ignore
+          retention-days: 30
 
   build:
     needs: changes
@@ -167,140 +269,3 @@ jobs:
       PREVIEW_ENV: preview
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - name: Compute TTL expiry
-        id: ttl
-        run: |
-          EXPIRES_AT=$(date -u -d "+${PREVIEW_TTL_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)
-          echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
-          echo "Preview TTL expires at ${EXPIRES_AT}"
-      - name: Provision isolated Postgres/Redis
-        run: |
-          docker compose \
-            -p "${PREVIEW_PROJECT}" \
-            -f docker-compose.preview.yml \
-            up -d --wait
-          docker compose -p "${PREVIEW_PROJECT}" ps
-      - name: Tag preview resources with PR number and TTL
-        run: |
-          docker compose -p "${PREVIEW_PROJECT}" ps -q | while read -r cid; do
-            [ -z "$cid" ] && continue
-            docker update \
-              --label "preview.pr=${PR_NUMBER}" \
-              --label "preview.ttl_hours=${PREVIEW_TTL_HOURS}" \
-              --label "preview.expires_at=${{ steps.ttl.outputs.expires_at }}" \
-              "$cid"
-          done
-      - name: Wait for Postgres readiness
-        run: |
-          for i in $(seq 1 30); do
-            if docker compose -p "${PREVIEW_PROJECT}" exec -T postgres pg_isready -U "${PREVIEW_DB_USER}" -d "${PREVIEW_DB_NAME}" >/dev/null 2>&1; then
-              echo "Postgres ready"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Postgres did not become ready in time" >&2
-          exit 1
-      - name: Run migrations
-        env:
-          DATABASE_URL: postgres://${PREVIEW_DB_USER}:${PREVIEW_DB_PASSWORD}@localhost:5432/${PREVIEW_DB_NAME}
-          REDIS_URL: redis://:${PREVIEW_REDIS_PASSWORD}@localhost:6379/0
-          NODE_ENV: preview
-        run: npm run db:migrate
-      - name: Seed synthetic data
-        env:
-          DATABASE_URL: postgres://${PREVIEW_DB_USER}:${PREVIEW_DB_PASSWORD}@localhost:5432/${PREVIEW_DB_NAME}
-          REDIS_URL: redis://:${PREVIEW_REDIS_PASSWORD}@localhost:6379/0
-          NODE_ENV: preview
-          SEED_PROFILE: synthetic
-        run: npm run db:seed
-      - name: Deploy backend with preview-only secrets
-        env:
-          DATABASE_URL: postgres://${PREVIEW_DB_USER}:${PREVIEW_DB_PASSWORD}@localhost:5432/${PREVIEW_DB_NAME}
-          REDIS_URL: redis://:${PREVIEW_REDIS_PASSWORD}@localhost:6379/0
-          API_TOKEN: ${PREVIEW_API_TOKEN}
-          NODE_ENV: preview
-          PREVIEW_ENV: ${PREVIEW_ENV}
-          PREVIEW_PR: ${PR_NUMBER}
-          PREVIEW_TTL_HOURS: ${PREVIEW_TTL_HOURS}
-        run: |
-          # Preview deployments must never receive production credentials.
-          # All values above are ephemeral, preview-scoped, and non-production.
-          npm run deploy:preview -- \
-            --project "${PREVIEW_PROJECT}" \
-            --pr "${PR_NUMBER}" \
-            --ttl-hours "${PREVIEW_TTL_HOURS}" \
-            --expires-at "${{ steps.ttl.outputs.expires_at }}"
-      - name: Record preview metadata
-        run: |
-          mkdir -p .preview
-          cat > .preview/metadata.json <<EOF
-          {
-            "pr": ${PR_NUMBER},
-            "project": "${PREVIEW_PROJECT}",
-            "ttlHours": ${PREVIEW_TTL_HOURS},
-            "expiresAt": "${{ steps.ttl.outputs.expires_at }}",
-            "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
-      - uses: actions/upload-artifact@v4
-        with:
-          name: preview-metadata-pr-${{ github.event.pull_request.number }}
-          path: .preview/metadata.json
-          retention-days: 7
-
-  preview-down:
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
-    concurrency:
-      group: preview-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      pull-requests: write
-    env:
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      PREVIEW_PROJECT: preview-pr-${{ github.event.pull_request.number }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Tear down preview compose project
-        run: |
-          mkdir -p .preview-audit
-          DESTROYED="[]"
-          if docker compose -p "${PREVIEW_PROJECT}" ps -q 2>/dev/null | grep -q .; then
-            DESTROYED=$(docker compose -p "${PREVIEW_PROJECT}" ps -q | while read -r cid; do
-              [ -z "$cid" ] && continue
-              docker inspect --format '{{.Name}}' "$cid" | sed 's#^/##'
-            done | jq -R . | jq -s .)
-          fi
-          docker compose -p "${PREVIEW_PROJECT}" down -v --remove-orphans || true
-          echo "${DESTROYED}" > .preview-audit/destroyed.json
-      - name: Verify teardown
-        run: |
-          REMAINING=$(docker compose -p "${PREVIEW_PROJECT}" ps -q 2>/dev/null | grep -c . || true)
-          if [ "${REMAINING}" -ne 0 ]; then
-            echo "Teardown verification failed: ${REMAINING} container(s) still running" >&2
-            exit 1
-          fi
-          echo "Teardown verified: no containers remain for ${PREVIEW_PROJECT}"
-      - name: Write audit record
-        run: |
-          mkdir -p .preview-audit
-          jq -n \
-            --argjson pr "${PR_NUMBER}" \
-            --arg project "${PREVIEW_PROJECT}" \
-            --argjson resources "$(cat .preview-audit/destroyed.json)" \
-            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{pr: $pr, project: $project, resourcesDestroyed: $resources, timestamp: $timestamp}' \
-            > .preview-audit/audit.json
-          cat .preview-audit/audit.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: preview-teardown-audit-pr-${{ github.event.pull_request.number }}
-          path: .preview-audit/audit.json
-          retention-days: 90
