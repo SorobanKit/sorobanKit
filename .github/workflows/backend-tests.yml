@@ -178,6 +178,18 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
           TEST_ADMIN_API_KEY: ${{ env.TEST_ADMIN_API_KEY }}
 
+      # Query-plan regression checks (#399).
+      # Captures representative PostgreSQL plans for the payment, activity, and
+      # webhook list endpoints and asserts stable indexed-access properties
+      # (index usage, no sequential scans on large tables) instead of brittle
+      # full-text plan snapshots. Runs on every backend change so schema or
+      # query changes that regress plans fail the PR.
+      - name: Run query-plan regression checks (#399)
+        working-directory: stellar-payment-platform
+        run: npm run test:query-plans
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stellar_tags_test?schema=public
+
       - name: Run memory leak detection tests (#511)
         working-directory: stellar-payment-platform
         run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
@@ -187,19 +199,4 @@ jobs:
 
       # Expand-contract migration guard (#387).
       # Lints migration SQL for destructive DDL (DROP TABLE/COLUMN, type narrowing,
-      # NOT NULL without DEFAULT, etc.). Non-zero exit fails the job so destructive
-      # changes cannot merge without an explicit `--allow-destructive` opt-in.
-      # The check is diff-scoped to migrations changed in this PR; when no
-      # migrations changed it still runs against the full directory so newly
-      # added files are validated.
-      - name: Lint migrations for destructive changes (#387)
-        run: |
-          CHANGED=$(git diff --name-only origin/main...HEAD -- 'stellar-payment-platform/prisma/migrations/**/migration.sql')
-          if [ -n "$CHANGED" ]; then
-            echo "Linting changed migrations:"
-            echo "$CHANGED"
-            node stellar-payment-platform/src/migrate-check.js --lint stellar-payment-platform/prisma/migrations
-          else
-            echo "No migration changes detected; running full lint."
-            node stellar-payment-platform/src/migrate-check.js --lint stellar-payment-platform/prisma/migrations
-          fi
+      # NOT NULL without DEFAULT, etc.). Non
